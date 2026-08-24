@@ -10,6 +10,7 @@ pub mod error;
 pub mod printer;
 pub mod protocol;
 pub mod pwsz;
+pub mod slicer;
 pub mod status;
 pub mod transport;
 pub mod upload;

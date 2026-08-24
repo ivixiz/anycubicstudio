@@ -22,12 +22,17 @@ The project supports two independent communication paths:
 | Automatic active-project resolution  | Fail-closed: requires exactly one known active project                                     |
 | LAN SSDP/bootstrap/MQTT              | Implemented based on Workshop 4.1.8; test M7 Pro did not advertise the LAN API            |
 | Standalone browser-based OAuth login | Not yet implemented; currently uses the token from an installed Workshop instance         |
+| STL and Core mesh-3MF slicing        | Implemented natively in Rust; structurally validated PWSZ                                 |
+| STEP/STP/IGES slicing                | Implemented through Gmsh tessellation; tested with `MDP-P906.step`                         |
+| `libanycubicstudio.so` C ABI         | Builds and exports default-config, slice, and last-error functions                         |
+| Generated PWSZ on physical printer   | Not tested yet; `calc_layer_volumes.data` grouping and previews remain experimental        |
 
 During a live test, `example.pwsz` was uploaded, parsed by the Cloud, started, and cancelled after 64 seconds. The project transitioned to `print_status = 3`, progress remained at zero, and the printer subsequently reported the idle state again.
 
 ## Requirements
 
 * Rust with Edition 2024 support;
+* `gmsh` in `PATH` for STEP/STP/IGES input (not needed for STL or Core mesh-3MF);
 * synchronized system date and time;
 * for Cloud mode — at least one successful login through an installed Photon Workshop instance;
 * for LAN mode — firmware that advertises `ac:3dprinter:lcd` via SSDP.
@@ -38,6 +43,75 @@ Project verification:
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+## Standalone PWSZ Slicer
+
+The default profile targets **Anycubic Photon Mono M7 Pro** and uses the resin settings recovered from the supplied Workshop job: 0.05 mm layers, five 28 s bottom layers, 1.8 s normal exposure, and 8 mm lift at 6 mm/s.
+
+```bash
+cargo run --release -- slice \
+  ../anycubic_disassembled/MDP-P906.step \
+  MDP-P906.pwsz
+
+cargo run -- pwsz MDP-P906.pwsz
+```
+
+The slicer accepts STL, the Core mesh/build/component subset of 3MF, STEP/STP, and IGES. By default it centres the model in XY and places its lowest Z point on the bed. It rejects models outside the M7 Pro build volume.
+
+The generated file is structurally compatible with the recovered PWSZ contract, but has not yet been accepted by the physical printer. Inspect it locally and do not start a print until the remaining firmware-specific member has been validated.
+
+### Rust API
+
+```rust
+use anycubicstudio::slicer::{SlicerConfig, slice_file};
+
+fn main() -> anycubicstudio::Result<()> {
+    let mut config = SlicerConfig::default();
+    config.transform.rotation_deg = [0.0, 0.0, 90.0];
+    config.transform.translation_mm = [10.0, 0.0, 0.0];
+    config.print.layer_height_mm = 0.05;
+
+    let report = slice_file("model.step", "model.pwsz", &config)?;
+    println!("{} layers, {:.3} ml", report.layer_count, report.estimated_volume_ml);
+    Ok(())
+}
+```
+
+Scale, move, rotate, exposure, lift, and machine/profile values are represented in the API. Support generation, hollowing, and non-zero XY contour offset intentionally return `UnsupportedSlicerOption`; they are not silently ignored.
+
+### Shared library / Bambu Studio integration
+
+```bash
+cargo build --release
+```
+
+This produces `target/release/libanycubicstudio.so`. The stable C interface is declared in [`include/anycubic_slicer.h`](include/anycubic_slicer.h):
+
+```cpp
+#include "anycubic_slicer.h"
+#include <cstdio>
+
+int main() {
+    AnycubicSlicerConfig config;
+    if (anycubic_slicer_default_config(&config) != 0)
+        return 1;
+
+    config.rotation_deg[2] = 90.0;
+    if (anycubic_slicer_slice("model.step", "model.pwsz", &config) != 0) {
+        std::fprintf(stderr, "%s\n", anycubic_slicer_last_error());
+        return 1;
+    }
+}
+```
+
+Example link flags:
+
+```bash
+c++ example.cpp -Iinclude -Ltarget/release \
+  -Wl,-rpath,"$PWD/target/release" -lanycubicstudio
+```
+
+For Bambu Studio, add the header and shared library to a small CMake target and call the C ABI from the plate export action. STEP conversion currently starts `gmsh`; a later integration can pass Bambu Studio's already tessellated mesh through an additional in-memory ABI and avoid that process.
 
 ## Cloud Authentication
 
@@ -171,6 +245,7 @@ After sending a control command, run `cloud-projects` again and monitor the stat
 | `cargo run --`                                    | Search for LAN printers via SSDP for 10 seconds | Read-only              |
 | `cargo run -- <HOST> <INFO_PORT>`                 | `GET http://HOST:PORT/info`                     | Read-only              |
 | `cargo run -- pwsz <FILE>`                        | Validate PWSZ metadata                          | Local, read-only       |
+| `cargo run --release -- slice <MODEL> <PWSZ>`     | Slice STL/3MF/STEP/IGES to a local PWSZ         | Local file creation    |
 | `cloud-status <CONFIG>`                           | List Cloud printers                             | Read-only              |
 | `cloud-status-detail <CONFIG>`                    | List printers and detailed status               | Read-only              |
 | `cloud-inspect <CONFIG>`                          | Show recent Cloud files and projects            | Read-only              |
@@ -408,7 +483,8 @@ src/
 ├── printer.rs    high-level LAN Printer
 ├── commands.rs   confirmed LAN commands
 ├── upload.rs     direct LAN HTTP upload
-├── pwsz.rs       conservative PWSZ parser
+├── pwsz.rs       PWSZ metadata and vector-layer parser
+├── slicer/       mesh import, contour slicing, writer, and C ABI
 ├── status.rs     progress and telemetry parsing
 └── error.rs      typed errors
 ```
@@ -421,7 +497,11 @@ Reverse-engineering details, function addresses, and JSON packets are documented
 * The Cloud API is undocumented by the manufacturer and may change.
 * Cloud pause/resume codes have not been live-tested on the current M7 Pro.
 * The test M7 Pro did not respond to Workshop SSDP, so Cloud communication was used instead.
-* `pwsz.rs` reads verified metadata and the layer container but is not a full slicer.
+* Generated PWSZ files have passed structural validation but not a physical printer test.
+* `calc_layer_volumes.data` has a confirmed container/record layout, but its adaptive M7 grouping algorithm is approximated with four-layer groups.
+* Preview members have the expected 224×168, 336×252, and 800×600 PNG dimensions, but currently contain a plain placeholder rather than a rendered model preview.
+* Supports, hollowing, drain holes, mesh repair, and XY contour compensation are not implemented yet.
+* The built-in 3MF reader handles Core meshes, build items, components, units, and transforms. It rejects files that declare required extensions; optional material and texture data are not used for monochrome resin slicing.
 * The library does not schedule print jobs and does not replace the printer's hardware safety interlocks.
 
 The project is not affiliated with Anycubic and uses an undocumented protocol. Before publishing or distributing it, check the applicable licenses and terms of service.

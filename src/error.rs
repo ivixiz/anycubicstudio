@@ -23,6 +23,14 @@ pub enum Error {
     Base64(#[from] base64::DecodeError),
     #[error("invalid protocol data: {0}")]
     Protocol(&'static str),
+    #[error("invalid 3D model: {0}")]
+    InvalidModel(String),
+    #[error("unsupported model format: {0}")]
+    UnsupportedModelFormat(String),
+    #[error("unsupported slicer option: {0}")]
+    UnsupportedSlicerOption(&'static str),
+    #[error("external mesh converter failed: {0}")]
+    MeshConverter(String),
     #[error("cloud API rejected request: {0}")]
     Cloud(String),
     #[error("printer rejected bootstrap request: {0}")]

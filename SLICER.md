@@ -102,11 +102,60 @@ build volume      = 223.642 × 126.480 × 230.000 mm
 
 Native `pwszImg` is neither PNG nor a raw LCD framebuffer.
 
-The first sample is only 2,776 bytes despite an LCD resolution of 13312×5120. In all inspected layers, the first 48 bytes are little-endian; in the first layer this starts with `7b 3d 3d 00` (`"{==\0"`), followed by four `f32` values at offsets `0x04..0x13`, then 28 bytes of fields that have not yet been identified.
+The first sample is only 2,776 bytes despite an LCD resolution of 13312×5120. Tracing `FUN_180397720 @ 0x180397720`, nested serializer `FUN_180399060 @ 0x180399060`, polygon converter `FUN_180396dc0 @ 0x180396dc0`, and layer preparation `FUN_18039a4c0 @ 0x18039a4c0` establishes the binary representation below. All integers and floats are little-endian.
 
-The subsequent stream contains coordinate-like `f32` values and byte tags.
+```text
+u32  outer_magic          0x003d3d7b, bytes "{==\0"
+f32  signed_twice_area    sum of contour shoelace products
+f32  min_x
+f32  min_y
+f32  max_x
+f32  max_y
+u32  auxiliary_count      zero in the supplied file
+u32  auxiliary[auxiliary_count]
+u32  contour_count
+u32  inner_magic          0x002d2d5b, bytes "[--\0"
+u32  inner_reserved       zero in the supplied file
+u32  segment_count
+u32  encoding             1 for the binary encoding below
 
-This is consistent with a segmented/vector representation, but the record types, filling rules, and rendering procedure are **not yet proven**. The new Rust implementation therefore intentionally exposes this data as raw bytes rather than presenting a hypothesis as a decoder.
+segment[segment_count]:   exactly 17 bytes per record
+    f32 x1
+    f32 y1
+    f32 x2
+    f32 y2
+    u8  direction
+
+u32  inner_footer         0x005d2d2d, bytes "--]\0"
+u32  outer_footer         0x007d3d3d, bytes "==}\0"
+```
+
+For each oriented contour edge, the endpoint with the lower Y coordinate is stored first. `direction = 1` means this order is the original contour direction; `direction = 0` means the endpoints were swapped. Records are sorted by their lower Y coordinate. With an empty auxiliary vector the header before the first record is 48 bytes and total size is `56 + 17 * segment_count`.
+
+The supplied file and the new writer both use millimetres around the centre of the platform. Outer contours are counter-clockwise and holes clockwise in the independent implementation; the signed shoelace sum therefore subtracts holes.
+
+### `scene.slice`
+
+`FUN_180342ad0 @ 0x180342ad0` writes a fixed 388-byte header:
+
+```text
+0x000  char[16] "ANYCUBIC-PWSZ\0\0\0"
+0x010  char[64] "AnycubicPhotonWorkshop Exports\0..."
+0x050  u32 3
+0x054  u32 3
+0x058  u32 0
+0x05c  u32 0
+0x060  f32 1.0
+0x064  u32 layer_count
+0x068  f32[6] scene bounds: min_x,min_y,min_z,max_x,max_y,max_z
+0x080  u32[65] reserved/zero in the sample
+```
+
+It is followed by magic `0x2d2d2d3c` (`"<---"`), `u32 layer_count`, and one 64-byte record per layer. A record is `f32 z`, `f32 area`, four bounds, `u32 contour_count`, and nine zero/reserved words. The stream ends with `0x3e2d2d2d` (`"--->"`). `example.pwsz` is exactly `388 + 8 + 326*64 + 4 = 21,264` bytes.
+
+### `calc_layer_volumes.data`
+
+The container is partly recovered from `FUN_180358c80 @ 0x180358c80`: a 16-byte header (`u32 version`, `f32 precision`, `u32 enabled`, `u32 record_count`) followed by 48-byte records. In the supplied sample the header is `0x20251024`, `0.2`, `1`, `78`. The first fields of a record are a layer index and two floats; the final float behaves as grouped layer volume. The exact M7 Pro adaptive grouping policy is not yet proved. The independent writer emits deterministic four-layer groups with zero reserved fields, so this member remains the main printer-validation risk.
 
 ## PWSCENE Format
 
@@ -129,9 +178,35 @@ The internal `header` begins with `ANYCUBIC-SCENE\0`, followed by a build string
 
 This is an editable project format rather than a print-job file, so it is not required for either uploading or the PWSZ reader.
 
-## Rust Implementation of the Verified Subset
+## Independent Rust Implementation
 
-The [`src/pwsz.rs`](src/pwsz.rs) module was added. `PwszArchive::open` reads the ZIP archive, strictly checks `layers_controller.count` against both the JSON array and the number of `layer_images`, and exposes the profile, metadata, previews, and raw layers.
+[`src/pwsz.rs`](src/pwsz.rs) reads the ZIP archive, strictly checks `layers_controller.count` against both the JSON array and the number of `layer_images`, and validates/decodes the recovered vector layer stream.
+
+[`src/slicer/`](src/slicer/) contains a new implementation that does not call the proprietary Windows slicing engine:
+
+```text
+STL / mesh-3MF / STEP or IGES
+  -> triangular mesh
+  -> scale / rotate / move / centre / place on bed
+  -> triangle-plane intersections at (layer + 0.5) * layer_height
+  -> stitch and orient contours
+  -> 17-byte PWSZ vector records
+  -> metadata + scene.slice + PWSZ ZIP
+```
+
+STL and the Core mesh/build/component subset of 3MF are read directly. STEP and IGES are tessellated through the installed `gmsh` executable. The latter makes the Linux `.so` independent of the Windows MSVC ABI, but it is currently a runtime dependency for CAD input.
+
+The supplied `MDP-P906.step` test produced:
+
+```text
+3,746 triangles
+1,314 layers at 0.05 mm
+bounds 100.700 × 13.500 × 65.680 mm
+estimated resin volume 14.997 ml
+1,324 valid ZIP members
+```
+
+All 1,314 layer members passed magic, count, record-size, and footer validation. `scene.slice` has the expected exact length and delimiters. This proves structural self-consistency, not yet acceptance or printing by M7 Pro firmware.
 
 Verification using an actual sample:
 
@@ -165,24 +240,26 @@ The decompiled DLLs confirm a specific set of geometry operations:
 
   `VoxSDKTriangleEdit.dll` contains `PlaneCut::cut`, `Shell2Parts::convert`, and a separate `Perforation` implementation.
 
-## What Still Needs to Be Investigated
+## What Still Needs to Be Investigated or Decompiled
 
-All requested DLLs are already available, so no additional decompilation is required for a minimal PWSZ uploader/inspector. The next steps involve tracing specific functions rather than searching for more files:
+No additional DLL is required to run the current independent default slicer. The following evidence would reduce compatibility risk or is required for feature parity:
 
-1. Implementations of the `pwszImg` virtual methods selected by `CreateInstance::newSlicedImage @ 0x1800041f6`, to precisely describe the stream following the 48-byte header.
+1. **`step_iges_datachange_r.dll`** is missing from `anycubic_disassembled`. `mainwindow.dll` function `FUN_1801eea60 @ 0x1801eea60` calls `StepIgesDataChange::{OpenFile,read,getVertexs,getIndices,closefile}` from it. Decompile this DLL to recover Workshop's original STEP/IGES chord tolerance, angular deflection, unit handling, and assembly policy. The current implementation deliberately uses Gmsh instead.
 
-2. `FUN_180358c80 @ 0x180358c80` and reader `FUN_180351040 @ 0x180351040`, to reconstruct the binary `calc_layer_volumes.data` and `scene.slice` formats.
+2. Trace all fields populated in `ModelCalcLayerVolumeInfo` before `FUN_180358c80 @ 0x180358c80`, plus reader `FUN_180351040 @ 0x180351040`. This is needed to reproduce the firmware's adaptive grouping policy rather than the current deterministic approximation.
 
-3. `mesh_0.vf` / `node_0.nd` and the project writer, but only if compatible `.pwscene` writing is required. This is independent from generating a printable file.
+3. Supply one fresh PWSZ made by Workshop **4.1.8** from the same `MDP-P906.step`, with supports/hollow/offset disabled and the documented default resin. The present sample identifies itself as Workshop 4.1.5. A matched file allows layer-by-layer differential validation.
 
-4. New files produced by Workshop 4.1.8 and by a different printer model, to distinguish the general PWSZ specification from M7 Pro-specific profile details.
+4. Supply small files exercising one feature at a time: one hole, one hollow shell, one manual support, one automatic support, and positive/negative XY compensation. These fixtures are more useful than more bulk decompilation for observable-output tests.
+
+5. For exact support/hollow parity, continue field reconstruction of `VoxSDKSupportGeneration.dll`, `TreeSupportLib.dll`, `VoxSDKTriangleHollow.dll`, and `AcPerforate.dll`. Their exported MSVC C++ structures are not stable ABIs, so an open implementation can instead use independent algorithms while preserving the final PWSZ contract.
+
+6. `mesh_0.vf`, `node_0.nd`, and the project writer are needed only for compatible editable `.pwscene` output, not for printable PWSZ generation.
 
 ## Architectural Implications for Rust and Bambu Studio
 
-The Rust network client should remain independent from the slicer.
+The Rust network client remains independent from the slicer.
 
-Temporary compatibility with the proprietary slicing core is possible only through a small C++ adapter or a separate process: the exported interface of `wrapper_slicer_engine_r` uses the MSVC C++ ABI rather than a stable C ABI suitable for direct Rust FFI.
+The new library builds both an `rlib` and `libanycubicstudio.so` and exports a small C ABI in [`include/anycubic_slicer.h`](include/anycubic_slicer.h). This is the intended Bambu Studio integration boundary. The proprietary core remains unsuitable for direct linkage because its interface uses the MSVC C++ ABI.
 
-For an open implementation, the better approach is to reproduce the slicing pipeline and writer after validating PWSZ against real files.
-
-Bambu Studio components can be considered as a source of ideas/code for an open SLA slicing pipeline, but its AGPL-3.0 license must be taken into account before integration.
+The current contour slicer is intentionally independent. If Bambu Studio geometry/support code is copied rather than merely called through a boundary, its AGPL-3.0 licensing obligations must be handled by the distributor.

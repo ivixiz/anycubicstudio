@@ -1,9 +1,8 @@
 //! Reader for the ZIP-based PWSZ print-job container.
 //!
-//! This module intentionally reads only the parts proved by a real PWSZ file
-//! and the 4.1.8 writer/reader code.  `pwszImg` payloads are exposed as bytes:
-//! their 48-byte header is observable, but the following segment stream has
-//! not yet been completely reversed and must not be mistaken for a bitmap.
+//! This module reads the parts proved by a real PWSZ file and the 4.1.8
+//! writer/reader code. Native `pwszImg` members contain sorted vector segments,
+//! not PNG images or LCD-sized bitmaps.
 
 use std::{
     fs::File,
@@ -272,31 +271,84 @@ pub struct PwszLayerImage {
 }
 
 impl PwszLayerImage {
-    /// Returns the fixed, observed 48-byte little-endian prefix. `tail` is
-    /// intentionally opaque until the segment encoding has been fully proved.
+    /// Parses and validates the recovered little-endian vector header.
     pub fn header(&self) -> Result<PwszImageHeader> {
         PwszImageHeader::parse(&self.bytes)
     }
 
+    /// Returns the binary segment stream, validating both footer magic values.
+    pub fn segments(&self) -> Result<Vec<PwszSegment>> {
+        let header = self.header()?;
+        if header.encoding != 1 {
+            return Err(Error::Protocol(
+                "pwszImg uses an unsupported non-binary segment encoding",
+            ));
+        }
+        let segment_bytes = (header.segment_count as usize)
+            .checked_mul(PwszSegment::LEN)
+            .ok_or(Error::Protocol("pwszImg segment byte count overflows"))?;
+        let expected_len = header
+            .header_len
+            .checked_add(segment_bytes)
+            .and_then(|length| length.checked_add(8))
+            .ok_or(Error::Protocol("pwszImg total byte count overflows"))?;
+        if self.bytes.len() != expected_len {
+            return Err(Error::Protocol(
+                "pwszImg length does not match its segment count",
+            ));
+        }
+        let footer = header.header_len + segment_bytes;
+        if read_u32(&self.bytes, footer)? != 0x005d_2d2d
+            || read_u32(&self.bytes, footer + 4)? != 0x007d_3d3d
+        {
+            return Err(Error::Protocol("invalid pwszImg footer magic"));
+        }
+        (0..header.segment_count as usize)
+            .map(|index| {
+                let offset = header.header_len + index * PwszSegment::LEN;
+                Ok(PwszSegment {
+                    start: [
+                        read_f32(&self.bytes, offset)?,
+                        read_f32(&self.bytes, offset + 4)?,
+                    ],
+                    end: [
+                        read_f32(&self.bytes, offset + 8)?,
+                        read_f32(&self.bytes, offset + 12)?,
+                    ],
+                    direction: self.bytes[offset + 16] != 0,
+                })
+            })
+            .collect()
+    }
+
     pub fn payload(&self) -> Result<&[u8]> {
-        Ok(&self.bytes[PwszImageHeader::LEN..])
+        let header = self.header()?;
+        Ok(&self.bytes[header.header_len..])
     }
 }
 
-/// Observed fixed prefix of native `pwszImg` data.
+/// Recovered header of native `pwszImg` data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PwszImageHeader {
-    /// Observed sample bytes: `7b 3d 3d 00` (`"{==\\0"`). The writer code
-    /// alone does not yet prove its semantic name, so it is not validated.
+    /// Bytes `7b 3d 3d 00` (`"{==\\0"`).
     pub magic: [u8; 4],
-    /// Four little-endian IEEE-754 values at offsets `0x04..0x13`.
+    /// Sum of contour shoelace products, i.e. signed area multiplied by two.
+    pub signed_twice_area: f32,
+    /// `min_x, min_y, max_x, max_y`, in millimetres around the platform centre.
     pub bounds: [f32; 4],
-    /// Bytes `0x14..0x2f`, kept verbatim because their field layout is not yet
-    /// fully established.
-    pub tail: [u8; 28],
+    pub auxiliary_indices: Vec<u32>,
+    pub contour_count: u32,
+    pub inner_magic: u32,
+    pub inner_reserved: u32,
+    pub segment_count: u32,
+    /// `1` selects the observed 17-byte binary segment representation.
+    pub encoding: u32,
+    pub header_len: usize,
 }
 
 impl PwszImageHeader {
+    /// Header length when the auxiliary index vector is empty (as in the
+    /// supplied sample and files produced by the independent slicer).
     pub const LEN: usize = 48;
 
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -307,18 +359,70 @@ impl PwszImageHeader {
         }
         let mut magic = [0; 4];
         magic.copy_from_slice(&bytes[..4]);
+        if magic != [0x7b, 0x3d, 0x3d, 0] {
+            return Err(Error::Protocol("invalid pwszImg outer magic"));
+        }
+        let signed_twice_area = read_f32(bytes, 4)?;
         let bounds = std::array::from_fn(|index| {
-            let offset = 4 + index * 4;
+            let offset = 8 + index * 4;
             f32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed range"))
         });
-        let mut tail = [0; 28];
-        tail.copy_from_slice(&bytes[20..Self::LEN]);
+        let auxiliary_count = read_u32(bytes, 24)? as usize;
+        let header_len = Self::LEN
+            .checked_add(auxiliary_count.saturating_mul(4))
+            .ok_or(Error::Protocol("pwszImg header length overflows"))?;
+        if bytes.len() < header_len {
+            return Err(Error::Protocol("truncated pwszImg auxiliary vector"));
+        }
+        let auxiliary_indices = (0..auxiliary_count)
+            .map(|index| read_u32(bytes, 28 + index * 4))
+            .collect::<Result<Vec<_>>>()?;
+        let base = 28 + auxiliary_count * 4;
+        let contour_count = read_u32(bytes, base)?;
+        let inner_magic = read_u32(bytes, base + 4)?;
+        if inner_magic != 0x002d_2d5b {
+            return Err(Error::Protocol("invalid pwszImg inner magic"));
+        }
+        let inner_reserved = read_u32(bytes, base + 8)?;
+        let segment_count = read_u32(bytes, base + 12)?;
+        let encoding = read_u32(bytes, base + 16)?;
         Ok(Self {
             magic,
+            signed_twice_area,
             bounds,
-            tail,
+            auxiliary_indices,
+            contour_count,
+            inner_magic,
+            inner_reserved,
+            segment_count,
+            encoding,
+            header_len,
         })
     }
+}
+
+/// One normalized polygon edge from a binary `pwszImg` stream.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PwszSegment {
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+    /// Preserves the original contour direction after endpoints were sorted by Y.
+    pub direction: bool,
+}
+
+impl PwszSegment {
+    pub const LEN: usize = 17;
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(Error::Protocol("truncated pwszImg integer"))?;
+    Ok(u32::from_le_bytes(value.try_into().expect("fixed range")))
+}
+
+fn read_f32(bytes: &[u8], offset: usize) -> Result<f32> {
+    Ok(f32::from_bits(read_u32(bytes, offset)?))
 }
 
 fn read_json<R: Read + Seek, T: for<'de> Deserialize<'de>>(
@@ -367,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_known_pwsz_members_without_decoding_the_layer_stream() {
+    fn reads_known_pwsz_members_and_decodes_the_layer_stream() {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
         for (name, contents) in [
@@ -380,12 +484,22 @@ mod tests {
             writer.start_file(name, options).unwrap();
             std::io::Write::write_all(&mut writer, contents).unwrap();
         }
-        let mut layer = [0_u8; PwszImageHeader::LEN];
-        layer[..4].copy_from_slice(&[0x7b, 0x3d, 0x3d, 0]);
-        layer[4..8].copy_from_slice(&1.0_f32.to_le_bytes());
-        layer[8..12].copy_from_slice(&2.0_f32.to_le_bytes());
-        layer[12..16].copy_from_slice(&3.0_f32.to_le_bytes());
-        layer[16..20].copy_from_slice(&4.0_f32.to_le_bytes());
+        let mut layer = Vec::new();
+        for value in [0x003d_3d7b_u32, 1.0_f32.to_bits()] {
+            layer.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [1.0_f32, 2.0, 3.0, 4.0] {
+            layer.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0_u32, 1, 0x002d_2d5b, 0, 1, 1] {
+            layer.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [1.0_f32, 2.0, 3.0, 4.0] {
+            layer.extend_from_slice(&value.to_le_bytes());
+        }
+        layer.push(1);
+        layer.extend_from_slice(&0x005d_2d2d_u32.to_le_bytes());
+        layer.extend_from_slice(&0x007d_3d3d_u32.to_le_bytes());
         writer
             .start_file("layer_images/layer_0.pwszImg", options)
             .unwrap();
@@ -402,6 +516,15 @@ mod tests {
         let header = image.header().unwrap();
         assert_eq!(header.magic, [0x7b, 0x3d, 0x3d, 0]);
         assert_eq!(header.bounds, [1.0, 2.0, 3.0, 4.0]);
-        assert!(image.payload().unwrap().is_empty());
+        assert_eq!(header.signed_twice_area, 1.0);
+        assert_eq!(header.contour_count, 1);
+        assert_eq!(
+            image.segments().unwrap(),
+            [PwszSegment {
+                start: [1.0, 2.0],
+                end: [3.0, 4.0],
+                direction: true,
+            }]
+        );
     }
 }

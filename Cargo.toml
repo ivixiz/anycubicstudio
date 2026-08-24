@@ -3,12 +3,17 @@ name = "anycubicstudio"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 aes = "0.8"
 anyhow = "1"
 base64 = "0.22"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 futures-util = "0.3"
+crc32fast = "1"
+flate2 = "1"
 md-5 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }

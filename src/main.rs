@@ -17,6 +17,33 @@ use anycubicstudio::pwsz::PwszArchive;
 async fn main() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     let host = arguments.next();
+    if host.as_deref() == Some("slice") {
+        let input = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: anycubicstudio slice <model.step|stl|3mf> <output.pwsz>")
+        })?;
+        let output = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: anycubicstudio slice <model.step|stl|3mf> <output.pwsz>")
+        })?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio slice <model.step|stl|3mf> <output.pwsz>"
+            ));
+        }
+        let report = anycubicstudio::slicer::slice_file(
+            input,
+            output,
+            &anycubicstudio::slicer::SlicerConfig::default(),
+        )?;
+        println!(
+            "Created PWSZ: {} triangles, {} layers, {:.3} ml, {} bytes; bounds {:?} mm",
+            report.triangle_count,
+            report.layer_count,
+            report.estimated_volume_ml,
+            report.output_bytes,
+            report.bounds_mm,
+        );
+        return Ok(());
+    }
     if matches!(
         host.as_deref(),
         Some("cloud-status") | Some("cloud-status-detail")
