@@ -1,0 +1,10 @@
+/target
+
+# Account bearer credentials.  The client can read Workshop's file in place;
+# never copy it into the repository.
+global_config.ini
+.env
+.env.*
+!.env.example
+secrets/
+enviroment.ini
