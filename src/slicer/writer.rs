@@ -11,7 +11,7 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::Result;
 
-use super::{SlicerConfig, geometry::LayerSlice, mesh::Mesh};
+use super::{SlicerConfig, geometry::LayerSlice, mesh::Mesh, render::render_previews};
 
 const OUTER_MAGIC: u32 = 0x003d_3d7b; // "{==\0"
 const OUTER_FOOTER: u32 = 0x007d_3d3d; // "==}\0"
@@ -24,7 +24,8 @@ pub(crate) fn write_pwsz(
     output: &Path,
     input: &Path,
     config: &SlicerConfig,
-    mesh: &Mesh,
+    model: &Mesh,
+    supports: &Mesh,
     layers: &[LayerSlice],
     volume_mm3: f64,
 ) -> Result<()> {
@@ -54,8 +55,8 @@ pub(crate) fn write_pwsz(
         options,
     )?;
 
-    for (index, [width, height]) in [[224, 168], [336, 252], [800, 600]].into_iter().enumerate() {
-        let preview = placeholder_png(width, height)?;
+    for (index, rendered) in render_previews(model, supports).into_iter().enumerate() {
+        let preview = encode_png(rendered.width, rendered.height, &rendered.rgba)?;
         write_member(
             &mut archive,
             &format!("preview_images/preview_{index}.png"),
@@ -73,7 +74,7 @@ pub(crate) fn write_pwsz(
     write_json(
         &mut archive,
         "lcd_function.json",
-        &lcd_function(input),
+        &lcd_function(input, config),
         options,
     )?;
     for layer in layers {
@@ -93,7 +94,7 @@ pub(crate) fn write_pwsz(
     write_member(
         &mut archive,
         "scene.slice",
-        &encode_scene(mesh, layers),
+        &encode_scene(model, supports, layers),
         options,
     )?;
     archive.finish()?;
@@ -240,7 +241,7 @@ fn layers_controller(config: &SlicerConfig, layers: &[LayerSlice]) -> Value {
     json!({"count":layers.len(), "paras":parameters})
 }
 
-fn lcd_function(input: &Path) -> Value {
+fn lcd_function(input: &Path, config: &SlicerConfig) -> Value {
     let name = input
         .file_name()
         .and_then(|name| name.to_str())
@@ -248,8 +249,10 @@ fn lcd_function(input: &Path) -> Value {
     json!({
         "models_processed_info": {
             "models":[{
-                "auto_support":0, "hollow":0, "makeronline_sourceid":-1,
-                "manual_support":0, "name":name, "punch":0, "source_from":0
+                "auto_support":u8::from(config.supports.enabled && config.supports.auto_generate),
+                "hollow":u8::from(config.hollow), "makeronline_sourceid":-1,
+                "manual_support":u8::from(!config.supports.manual_points.is_empty()),
+                "name":name, "punch":0, "source_from":0
             }],
             "scene_models_from":0, "slice_paras_process":1,
             "software_version":concat!("anycubicstudio_", env!("CARGO_PKG_VERSION"))
@@ -286,8 +289,17 @@ pub(crate) fn encode_layer(layer: &LayerSlice) -> Vec<u8> {
     output
 }
 
-fn encode_scene(mesh: &Mesh, layers: &[LayerSlice]) -> Vec<u8> {
-    let (minimum, maximum) = mesh.bounds();
+fn encode_scene(model: &Mesh, supports: &Mesh, layers: &[LayerSlice]) -> Vec<u8> {
+    let (mut minimum, mut maximum) = model.bounds();
+    if !supports.triangles.is_empty() {
+        let (support_minimum, support_maximum) = supports.bounds();
+        minimum.x = minimum.x.min(support_minimum.x);
+        minimum.y = minimum.y.min(support_minimum.y);
+        minimum.z = minimum.z.min(support_minimum.z);
+        maximum.x = maximum.x.max(support_maximum.x);
+        maximum.y = maximum.y.max(support_maximum.y);
+        maximum.z = maximum.z.max(support_maximum.z);
+    }
     let mut output = Vec::with_capacity(400 + layers.len() * 64);
     output.extend_from_slice(b"ANYCUBIC-PWSZ\0\0\0");
     let mut description = [0_u8; 64];
@@ -385,15 +397,12 @@ fn push_f32(output: &mut Vec<u8>, value: f32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
-fn placeholder_png(width: u32, height: u32) -> Result<Vec<u8>> {
-    let mut scanline = Vec::with_capacity(1 + width as usize * 4);
-    scanline.push(0); // PNG scanline filter: None
-    for _ in 0..width {
-        scanline.extend_from_slice(&[20, 27, 41, 255]);
-    }
+fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>> {
+    debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
     let mut pixels = Vec::with_capacity((height as usize) * (1 + width as usize * 4));
-    for _ in 0..height {
-        pixels.extend_from_slice(&scanline);
+    for scanline in rgba.chunks_exact(width as usize * 4) {
+        pixels.push(0); // PNG scanline filter: None
+        pixels.extend_from_slice(scanline);
     }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(&pixels)?;

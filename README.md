@@ -23,9 +23,12 @@ The project supports two independent communication paths:
 | LAN SSDP/bootstrap/MQTT              | Implemented based on Workshop 4.1.8; test M7 Pro did not advertise the LAN API            |
 | Standalone browser-based OAuth login | Not yet implemented; currently uses the token from an installed Workshop instance         |
 | STL and Core mesh-3MF slicing        | Implemented natively in Rust; structurally validated PWSZ                                 |
-| STEP/STP/IGES slicing                | Implemented through Gmsh tessellation; tested with `MDP-P906.step`                         |
-| `libanycubicstudio.so` C ABI         | Builds and exports default-config, slice, and last-error functions                         |
-| Generated PWSZ on physical printer   | Not tested yet; `calc_layer_volumes.data` grouping and previews remain experimental        |
+| STEP/STP/IGES slicing                | Implemented through Gmsh tessellation; tested with `example.step`                         |
+| Automatic/manual vertical supports   | Light/medium/heavy presets, three pillar shapes, CLI/JSON/Rust/C configuration             |
+| PWSZ rendered previews               | Three real software-rendered views: 224×168, 336×252, and 800×600                          |
+| 3D and sliced-layer viewer           | Qt 6/OpenGL viewer with model/support visibility, camera, zoom, and layer slider           |
+| `libanycubicstudio.so` C ABI         | Builds and exports configuration, slicing, and explicit manual-support functions           |
+| Generated PWSZ on physical printer   | Not tested yet; `calc_layer_volumes.data` adaptive grouping remains experimental            |
 
 During a live test, `example.pwsz` was uploaded, parsed by the Cloud, started, and cancelled after 64 seconds. The project transitioned to `print_status = 3`, progress remained at zero, and the printer subsequently reported the idle state again.
 
@@ -33,6 +36,7 @@ During a live test, `example.pwsz` was uploaded, parsed by the Cloud, started, a
 
 * Rust with Edition 2024 support;
 * `gmsh` in `PATH` for STEP/STP/IGES input (not needed for STL or Core mesh-3MF);
+* CMake 3.21+, Qt 6 Widgets/OpenGL/OpenGLWidgets, and a working OpenGL 3.3 driver for the optional viewer;
 * synchronized system date and time;
 * for Cloud mode — at least one successful login through an installed Photon Workshop instance;
 * for LAN mode — firmware that advertises `ac:3dprinter:lcd` via SSDP.
@@ -50,26 +54,197 @@ The default profile targets **Anycubic Photon Mono M7 Pro** and uses the resin s
 
 ```bash
 cargo run --release -- slice \
-  ../anycubic_disassembled/MDP-P906.step \
-  MDP-P906.pwsz
+  ../anycubic_disassembled/example.step \
+  example.pwsz
 
-cargo run -- pwsz MDP-P906.pwsz
+cargo run -- pwsz example.pwsz
 ```
 
 The slicer accepts STL, the Core mesh/build/component subset of 3MF, STEP/STP, and IGES. By default it centres the model in XY and places its lowest Z point on the bed. It rejects models outside the M7 Pro build volume.
 
-The generated file is structurally compatible with the recovered PWSZ contract, but has not yet been accepted by the physical printer. Inspect it locally and do not start a print until the remaining firmware-specific member has been validated.
+Each generated PWSZ contains three rendered model previews, per-layer vector
+polygons, resin/machine settings, print estimates, `scene.slice`, and
+`calc_layer_volumes.data`. The generated file is structurally compatible with
+the recovered PWSZ contract, but has not yet been accepted by the physical
+printer. Inspect it locally and do not start a print until the remaining
+firmware-specific member has been validated.
+
+### Recommended local workflow
+
+Build the slicer and viewer once:
+
+```bash
+cargo build --release
+cmake -S viewer -B viewer/build -DCMAKE_BUILD_TYPE=Release
+cmake --build viewer/build --parallel
+```
+
+Inspect a transformed model and generated supports before writing PWSZ:
+
+```bash
+target/release/anycubicstudio viewer model.stl --supports medium
+```
+
+The first viewer mode renders the triangle mesh in teal and supports in blue.
+Drag with the left mouse button to rotate and use the wheel to zoom. Switch to
+`Sliced layer` and move the slider to inspect the exact final contours that will
+be encoded into `layer_<n>.pwszImg`. Model and supports are sliced separately
+and their oriented contours are merged, preventing a support inside a model
+outline from being misclassified as a hole.
+
+After inspecting the orientation and supports, create and validate the job:
+
+```bash
+target/release/anycubicstudio slice model.stl model.pwsz --supports medium
+target/release/anycubicstudio pwsz model.pwsz
+unzip -t model.pwsz
+```
+
+`viewer-scene` is the non-interactive equivalent. It writes an `.acv` scene
+that can be opened later or by another process:
+
+```bash
+target/release/anycubicstudio viewer-scene \
+  model.stl model.acv --supports medium
+target/release/anycubic-viewer model.acv
+```
+
+The `.acv` file is an internal inspection format, not a printer format and not
+an editable Workshop `.pwscene` project.
+
+### Slicer CLI options
+
+The same options are accepted by `slice`, `viewer`, and `viewer-scene`. For
+`viewer`, omit the output path.
+
+| Option | Meaning |
+| --- | --- |
+| `--config FILE` | Load the complete `SlicerConfig` JSON before applying subsequent CLI overrides. |
+| `--save-config FILE` | Save the final configuration after every option has been applied. |
+| `--supports none\|light\|medium\|heavy` | Disable supports or select a complete automatic-support preset. |
+| `--support-auto on\|off` | Enable/disable automatic contacts while retaining manual contacts and dimensions. |
+| `--support-shape cylinder\|tapered\|square` | Select the generated pillar cross-section/profile. |
+| `--support-spacing MM` | XY sampling/grid spacing for automatic contacts. Smaller values create more supports. |
+| `--support-angle DEG` | Downward overhang threshold, strictly between 1° and 89°. |
+| `--support-tip MM` | Contact-tip diameter. |
+| `--support-trunk MM` | Main shaft diameter. Must be at least the tip diameter. |
+| `--support-base MM` | Build-plate foot diameter. Must be at least the trunk diameter. |
+| `--support-tip-height MM` | Length of the tapered contact section. |
+| `--support-base-height MM` | Height of the build-plate foot. |
+| `--support-min-height MM` | Ignore shorter automatic supports; useful for suppressing contacts on a model already flat on the bed. |
+| `--support-max-height MM` | Reject supports longer than this value. |
+| `--support-segments N` | Radial polygon resolution for cylinder/tapered supports; square always uses four sides. |
+| `--manual-support X,Y,Z[,BASE_Z]` | Add one support contact. If `BASE_Z` is omitted, the nearest surface below or the plate is used. Repeatable. |
+| `--layer-height MM` | Layer thickness. Default: 0.05 mm. |
+| `--bottom-layers N` | Number of bottom layers. Default: 5. |
+| `--bottom-exposure SEC` | Bottom-layer exposure. Default: 28 s. |
+| `--exposure SEC` | Normal-layer exposure. Default: 1.8 s. |
+| `--lift-height MM` | Lift distance. Default: 8 mm. |
+| `--lift-speed MM_S` | Lift/retract speed used in the generated profile. Default: 6 mm/s. |
+| `--move X,Y,Z` | Translation in millimetres, applied after centring/bed placement. |
+| `--rotate X,Y,Z` | Euler rotations in degrees. |
+| `--scale X,Y,Z` | Per-axis positive scale. |
+| `--no-center` | Preserve the imported XY position instead of centring the transformed bounds. |
+| `--no-place-on-bed` | Preserve imported Z position instead of moving the lowest point to Z=0. |
+
+Support preset values:
+
+| Preset | Spacing | Tip | Trunk | Base | Tip height | Other defaults |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| light | 5.0 mm | 0.35 mm | 0.8 mm | 3.5 mm | 1.5 mm | tapered, 45°, base height 0.8 mm |
+| medium | 4.0 mm | 0.5 mm | 1.2 mm | 4.5 mm | 1.5 mm | tapered, 45°, base height 0.8 mm |
+| heavy | 3.0 mm | 0.8 mm | 1.8 mm | 6.0 mm | 2.0 mm | tapered, 45°, base height 0.8 mm |
+
+All three use 0.15 mm contact penetration, a 2 mm minimum height, a 180 mm
+maximum height, and 12 radial segments. A later CLI option overrides the value
+selected by the preset. `--supports none` resets the support section to
+disabled medium defaults and clears manual contacts already loaded on the CLI;
+place any later `--manual-support` after it.
+
+Examples:
+
+```bash
+# Rotate, move, and use light tapered supports.
+target/release/anycubicstudio viewer model.stl \
+  --rotate 20,0,90 --move 5,0,8 --supports light
+
+# Manual-only supports. Repeat --manual-support as needed.
+target/release/anycubicstudio slice model.stl model.pwsz \
+  --supports medium --support-auto off \
+  --manual-support 12.5,-4.0,31.2 \
+  --manual-support '-8.0,2.0,24.0,0.0'
+
+# Save a reproducible JSON profile after applying overrides.
+target/release/anycubicstudio slice model.stl model.pwsz \
+  --supports heavy --support-tip 0.7 --save-config model-config.json
+```
+
+Quote a `--manual-support` value when its first coordinate is negative so the
+shell passes it as one argument.
+
+Generate a complete default JSON file without slicing:
+
+```bash
+target/release/anycubicstudio slicer-default-config slicer.json
+```
+
+The support portion of that JSON has the following shape and may be edited
+directly. Enum strings use `snake_case`:
+
+```json
+{
+  "supports": {
+    "enabled": true,
+    "auto_generate": false,
+    "shape": "tapered",
+    "overhang_angle_deg": 45.0,
+    "spacing_mm": 4.0,
+    "tip_diameter_mm": 0.5,
+    "trunk_diameter_mm": 1.2,
+    "base_diameter_mm": 4.5,
+    "tip_height_mm": 1.5,
+    "base_height_mm": 0.8,
+    "penetration_mm": 0.15,
+    "min_height_mm": 2.0,
+    "max_height_mm": 180.0,
+    "radial_segments": 12,
+    "manual_points": [
+      {"contact_mm": [4.0, -3.0, 18.0], "base_z_mm": null}
+    ]
+  }
+}
+```
+
+This is only a fragment for explanation; `--config` expects the complete
+`SlicerConfig` produced by `slicer-default-config` or `--save-config`.
+
+The preset algorithm generates independent vertical tiered pillars. It is not
+yet Workshop's branched/tree-support engine. Always inspect contacts and sliced
+layers, especially for islands, internal cavities, fragile details, and meshes
+with inconsistent triangle winding.
+
+If `viewer` cannot find its executable, set `ANYCUBIC_VIEWER` to an absolute
+path. The default search checks the slicer binary's directory,
+`target/release/anycubic-viewer`, and `viewer/build/anycubic-viewer`. The viewer
+requires a graphical session and OpenGL 3.3; it is not intended for headless
+servers. PWSZ generation itself is headless and does not depend on Qt/OpenGL.
 
 ### Rust API
 
 ```rust
-use anycubicstudio::slicer::{SlicerConfig, slice_file};
+use anycubicstudio::slicer::{SlicerConfig, SupportShape, slice_file};
 
 fn main() -> anycubicstudio::Result<()> {
     let mut config = SlicerConfig::default();
     config.transform.rotation_deg = [0.0, 0.0, 90.0];
     config.transform.translation_mm = [10.0, 0.0, 0.0];
     config.print.layer_height_mm = 0.05;
+    config.supports.enabled = true;
+    config.supports.auto_generate = true;
+    config.supports.shape = SupportShape::Tapered;
+    config.supports.tip_diameter_mm = 0.5;
+    config.supports.trunk_diameter_mm = 1.2;
+    config.supports.add_manual_point([4.0, -3.0, 18.0], None);
 
     let report = slice_file("model.step", "model.pwsz", &config)?;
     println!("{} layers, {:.3} ml", report.layer_count, report.estimated_volume_ml);
@@ -77,7 +252,10 @@ fn main() -> anycubicstudio::Result<()> {
 }
 ```
 
-Scale, move, rotate, exposure, lift, and machine/profile values are represented in the API. Support generation, hollowing, and non-zero XY contour offset intentionally return `UnsupportedSlicerOption`; they are not silently ignored.
+Scale, move, rotate, exposure, lift, machine/profile values, automatic support
+presets, and manual support contacts are represented in the public Rust API.
+Hollowing and non-zero XY contour offset still return
+`UnsupportedSlicerOption`; they are not silently ignored.
 
 ### Shared library / Bambu Studio integration
 
@@ -97,12 +275,39 @@ int main() {
         return 1;
 
     config.rotation_deg[2] = 90.0;
+    config.supports_enabled = 1;
+    config.supports_auto_generate = 1;
+    config.support_shape = 1; /* tapered */
     if (anycubic_slicer_slice("model.step", "model.pwsz", &config) != 0) {
         std::fprintf(stderr, "%s\n", anycubic_slicer_last_error());
         return 1;
     }
 }
 ```
+
+For explicit contacts call `anycubic_slicer_slice_with_supports`. A `NAN`
+`base_z_mm` asks the generator to find the nearest model surface below the
+contact and then fall back to the build plate:
+
+```cpp
+#include "anycubic_slicer.h"
+#include <cmath>
+
+AnycubicSupportPoint points[] = {
+    {{4.0, -3.0, 18.0}, NAN},
+    {{12.0, 5.0, 24.0}, 0.0},
+};
+
+config.supports_enabled = 1;
+config.supports_auto_generate = 0;
+int result = anycubic_slicer_slice_with_supports(
+    "model.stl", "model.pwsz", &config,
+    points, sizeof(points) / sizeof(points[0]));
+```
+
+`support_shape` is `0` for cylinder, `1` for tapered, and `2` for square.
+The returned error code is zero on success. On failure, read the thread-local
+message immediately with `anycubic_slicer_last_error()`.
 
 Example link flags:
 
@@ -112,6 +317,29 @@ c++ example.cpp -Iinclude -Ltarget/release \
 ```
 
 For Bambu Studio, add the header and shared library to a small CMake target and call the C ABI from the plate export action. STEP conversion currently starts `gmsh`; a later integration can pass Bambu Studio's already tessellated mesh through an additional in-memory ABI and avoid that process.
+
+### Prepared test jobs
+
+The requested local fixtures were generated with the M7 Pro profile and then
+validated by both the strict project PWSZ parser and `unzip -t`:
+
+| Output | Support decision | Result |
+| --- | --- | --- |
+| `test/core_last.pwsz` | `--supports medium`; the part is elevated and presents a large unsupported underside in the supplied orientation | 4,308 model triangles, 150 supports/18,000 support triangles, 1,320 layers, 42.243 ml estimate, 34,522,625 bytes |
+| `test/trumna_last.pwsz` | `--supports none`; the part already lies on a broad flat face, and short edge supports were visually judged unnecessary | 880 model triangles, 0 supports, 320 layers, 11.748 ml estimate, 980,434 bytes |
+
+SHA-256 checksums for the current files:
+
+```text
+aa63a22cd8173f4d9dd5f787303d844ead0a500ded3f16ba8e25931b2b44f179  test/core_last.pwsz
+ccbb04a68b75774a34d1e27937094d96543fed702ff52eeffbad4f429f6c8c8e  test/trumna_last.pwsz
+```
+
+These jobs were not uploaded or started on the physical printer. In
+particular, inspect all 150 contacts on `core_last` in the viewer before using
+resin. Passing ZIP/binary validation proves container consistency, not that the
+independent support placement is mechanically sufficient or that M7 Pro
+firmware accepts the still-approximate volume grouping.
 
 ## Cloud Authentication
 
@@ -246,6 +474,9 @@ After sending a control command, run `cloud-projects` again and monitor the stat
 | `cargo run -- <HOST> <INFO_PORT>`                 | `GET http://HOST:PORT/info`                     | Read-only              |
 | `cargo run -- pwsz <FILE>`                        | Validate PWSZ metadata                          | Local, read-only       |
 | `cargo run --release -- slice <MODEL> <PWSZ>`     | Slice STL/3MF/STEP/IGES to a local PWSZ         | Local file creation    |
+| `slicer-default-config <JSON>`                    | Write the complete default slicer configuration | Local file creation    |
+| `viewer <MODEL> [SLICE_OPTIONS]`                  | Generate a temporary scene and inspect it        | Local GUI/read-only    |
+| `viewer-scene <MODEL> <ACV> [SLICE_OPTIONS]`      | Export the internal viewer scene without a GUI   | Local file creation    |
 | `cloud-status <CONFIG>`                           | List Cloud printers                             | Read-only              |
 | `cloud-status-detail <CONFIG>`                    | List printers and detailed status               | Read-only              |
 | `cloud-inspect <CONFIG>`                          | Show recent Cloud files and projects            | Read-only              |
@@ -484,9 +715,23 @@ src/
 ├── commands.rs   confirmed LAN commands
 ├── upload.rs     direct LAN HTTP upload
 ├── pwsz.rs       PWSZ metadata and vector-layer parser
-├── slicer/       mesh import, contour slicing, writer, and C ABI
+├── slicer/
+│   ├── mesh.rs          STL/3MF readers, CAD conversion, transforms
+│   ├── geometry.rs      plane intersections, contours, layer merging
+│   ├── support.rs       automatic/manual vertical supports
+│   ├── render.rs        software-rendered PWSZ previews
+│   ├── viewer_scene.rs  compact viewer interchange file
+│   ├── writer.rs        PWSZ metadata and binary members
+│   └── ffi.rs           stable C ABI used by libanycubicstudio.so
 ├── status.rs     progress and telemetry parsing
 └── error.rs      typed errors
+
+viewer/
+├── CMakeLists.txt
+└── main.cpp      Qt 6/OpenGL model, support, and sliced-layer viewer
+
+include/
+└── anycubic_slicer.h    public C/C++ header
 ```
 
 Reverse-engineering details, function addresses, and JSON packets are documented in `PROTOCOL.md`. Slicer format and PWSZ analysis are documented in `SLICER.md`.
@@ -499,8 +744,9 @@ Reverse-engineering details, function addresses, and JSON packets are documented
 * The test M7 Pro did not respond to Workshop SSDP, so Cloud communication was used instead.
 * Generated PWSZ files have passed structural validation but not a physical printer test.
 * `calc_layer_volumes.data` has a confirmed container/record layout, but its adaptive M7 grouping algorithm is approximated with four-layer groups.
-* Preview members have the expected 224×168, 336×252, and 800×600 PNG dimensions, but currently contain a plain placeholder rather than a rendered model preview.
-* Supports, hollowing, drain holes, mesh repair, and XY contour compensation are not implemented yet.
+* Preview members now contain actual model/support renders at the expected 224×168, 336×252, and 800×600 dimensions. Their exact Workshop camera, lighting, and PNG compression are not byte-identical.
+* Supports are independent vertical cylinder/tapered/square pillars. Workshop-compatible tree/branched supports, island-aware optimisation, cross-bracing, and exact VoxSDK preset parity are not implemented.
+* Hollowing, drain holes, mesh repair, and XY contour compensation are not implemented yet.
 * The built-in 3MF reader handles Core meshes, build items, components, units, and transforms. It rejects files that declare required extensions; optional material and texture data are not used for monochrome resin slicing.
 * The library does not schedule print jobs and does not replace the printer's hardware safety interlocks.
 

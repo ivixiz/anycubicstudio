@@ -7,6 +7,9 @@
 mod ffi;
 mod geometry;
 mod mesh;
+mod render;
+mod support;
+mod viewer_scene;
 mod writer;
 
 use std::path::{Path, PathBuf};
@@ -15,9 +18,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
 
-use self::{geometry::slice_mesh, mesh::Mesh, writer::write_pwsz};
+use self::{
+    geometry::slice_mesh, mesh::Mesh, support::generate_supports, viewer_scene::write_viewer_scene,
+    writer::write_pwsz,
+};
 
-pub use ffi::AnycubicSlicerConfig;
+pub use ffi::{AnycubicSlicerConfig, AnycubicSupportPoint};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MachineConfig {
@@ -95,11 +101,96 @@ impl Default for Transform {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportShape {
+    Cylinder,
+    Tapered,
+    Square,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupportPoint {
+    pub contact_mm: [f64; 3],
+    /// `None` lets the generator find the nearest model surface below the
+    /// contact, falling back to the build plate.
+    pub base_z_mm: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupportConfig {
-    /// Reserved API surface. Setting this to true currently returns an error;
-    /// unsupported options are never silently ignored.
     pub enabled: bool,
+    pub auto_generate: bool,
+    pub shape: SupportShape,
+    pub overhang_angle_deg: f64,
+    pub spacing_mm: f64,
+    pub tip_diameter_mm: f64,
+    pub trunk_diameter_mm: f64,
+    pub base_diameter_mm: f64,
+    pub tip_height_mm: f64,
+    pub base_height_mm: f64,
+    pub penetration_mm: f64,
+    pub min_height_mm: f64,
+    pub max_height_mm: f64,
+    pub radial_segments: u32,
+    #[serde(default)]
+    pub manual_points: Vec<SupportPoint>,
+}
+
+impl SupportConfig {
+    pub fn light() -> Self {
+        Self {
+            enabled: false,
+            auto_generate: true,
+            shape: SupportShape::Tapered,
+            overhang_angle_deg: 45.0,
+            spacing_mm: 5.0,
+            tip_diameter_mm: 0.35,
+            trunk_diameter_mm: 0.8,
+            base_diameter_mm: 3.5,
+            tip_height_mm: 1.5,
+            base_height_mm: 0.8,
+            penetration_mm: 0.15,
+            min_height_mm: 2.0,
+            max_height_mm: 180.0,
+            radial_segments: 12,
+            manual_points: Vec::new(),
+        }
+    }
+
+    pub fn medium() -> Self {
+        Self {
+            tip_diameter_mm: 0.5,
+            trunk_diameter_mm: 1.2,
+            base_diameter_mm: 4.5,
+            spacing_mm: 4.0,
+            ..Self::light()
+        }
+    }
+
+    pub fn heavy() -> Self {
+        Self {
+            tip_diameter_mm: 0.8,
+            trunk_diameter_mm: 1.8,
+            base_diameter_mm: 6.0,
+            spacing_mm: 3.0,
+            tip_height_mm: 2.0,
+            ..Self::light()
+        }
+    }
+
+    pub fn add_manual_point(&mut self, contact_mm: [f64; 3], base_z_mm: Option<f64>) {
+        self.manual_points.push(SupportPoint {
+            contact_mm,
+            base_z_mm,
+        });
+    }
+}
+
+impl Default for SupportConfig {
+    fn default() -> Self {
+        Self::medium()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,10 +224,32 @@ impl Default for SlicerConfig {
 #[derive(Debug, Clone)]
 pub struct SliceReport {
     pub triangle_count: usize,
+    pub model_triangle_count: usize,
+    pub support_triangle_count: usize,
+    pub support_count: usize,
     pub layer_count: u32,
     pub bounds_mm: [f64; 6],
     pub estimated_volume_ml: f64,
     pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ViewerSceneReport {
+    pub model_triangle_count: usize,
+    pub support_triangle_count: usize,
+    pub support_count: usize,
+    pub layer_count: u32,
+    pub output_bytes: u64,
+}
+
+struct PreparedScene {
+    model: Mesh,
+    supports: Mesh,
+    combined: Mesh,
+    layers: Vec<geometry::LayerSlice>,
+    support_count: usize,
+    bounds: [f64; 6],
+    volume_mm3: f64,
 }
 
 /// Slices one STL, 3MF, STEP/STP or IGES model into a PWSZ file.
@@ -145,11 +258,57 @@ pub fn slice_file(
     output: impl AsRef<Path>,
     config: &SlicerConfig,
 ) -> Result<SliceReport> {
-    validate_config(config)?;
     let input = input.as_ref();
     let output = output.as_ref();
-    let mut mesh = Mesh::load(input, &config.gmsh_path)?;
-    mesh.apply_transform(&config.transform)?;
+    let scene = prepare_scene(input, config)?;
+    write_pwsz(
+        output,
+        input,
+        config,
+        &scene.model,
+        &scene.supports,
+        &scene.layers,
+        scene.volume_mm3,
+    )?;
+    Ok(SliceReport {
+        triangle_count: scene.combined.triangles.len(),
+        model_triangle_count: scene.model.triangles.len(),
+        support_triangle_count: scene.supports.triangles.len(),
+        support_count: scene.support_count,
+        layer_count: scene.layers.len() as u32,
+        bounds_mm: scene.bounds,
+        estimated_volume_ml: scene.volume_mm3 / 1000.0,
+        output_bytes: std::fs::metadata(output)?.len(),
+    })
+}
+
+/// Exports transformed triangles, generated supports, and every sliced contour
+/// to the compact binary scene consumed by the Qt/OpenGL viewer.
+pub fn export_viewer_scene(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    config: &SlicerConfig,
+) -> Result<ViewerSceneReport> {
+    let output = output.as_ref();
+    let scene = prepare_scene(input.as_ref(), config)?;
+    write_viewer_scene(output, config, &scene.model, &scene.supports, &scene.layers)?;
+    Ok(ViewerSceneReport {
+        model_triangle_count: scene.model.triangles.len(),
+        support_triangle_count: scene.supports.triangles.len(),
+        support_count: scene.support_count,
+        layer_count: scene.layers.len() as u32,
+        output_bytes: std::fs::metadata(output)?.len(),
+    })
+}
+
+fn prepare_scene(input: &Path, config: &SlicerConfig) -> Result<PreparedScene> {
+    validate_config(config)?;
+    let mut model = Mesh::load(input, &config.gmsh_path)?;
+    model.apply_transform(&config.transform)?;
+    let generated_supports = generate_supports(&model, &config.supports)?;
+    let supports = generated_supports.mesh;
+    let mut mesh = model.clone();
+    mesh.triangles.extend_from_slice(&supports.triangles);
     let (minimum, maximum) = mesh.bounds();
     let size = [
         maximum.x - minimum.x,
@@ -185,7 +344,13 @@ pub fn slice_file(
             minimum.x, maximum.x, minimum.y, maximum.y, minimum.z, maximum.z
         )));
     }
-    let layers = slice_mesh(&mesh, config.print.layer_height_mm)?;
+    let layers = if supports.triangles.is_empty() {
+        slice_mesh(&model, config.print.layer_height_mm)?
+    } else {
+        let model_layers = slice_mesh(&model, config.print.layer_height_mm)?;
+        let support_layers = slice_mesh(&supports, config.print.layer_height_mm)?;
+        geometry::merge_layers(&model_layers, &support_layers, config.print.layer_height_mm)
+    };
     if let Some(layer) = layers
         .iter()
         .find(|layer| layer.segments.len() > config.machine.max_segments_per_layer)
@@ -201,25 +366,20 @@ pub fn slice_file(
         .iter()
         .map(|layer| layer.area() * config.print.layer_height_mm)
         .sum::<f64>();
-    write_pwsz(output, input, config, &mesh, &layers, volume_mm3)?;
-    let output_bytes = std::fs::metadata(output)?.len();
-    Ok(SliceReport {
-        triangle_count: mesh.triangles.len(),
-        layer_count: layers.len() as u32,
-        bounds_mm: [
+    Ok(PreparedScene {
+        model,
+        supports,
+        combined: mesh,
+        layers,
+        support_count: generated_supports.count,
+        bounds: [
             minimum.x, minimum.y, minimum.z, maximum.x, maximum.y, maximum.z,
         ],
-        estimated_volume_ml: volume_mm3 / 1000.0,
-        output_bytes,
+        volume_mm3,
     })
 }
 
 fn validate_config(config: &SlicerConfig) -> Result<()> {
-    if config.supports.enabled {
-        return Err(Error::UnsupportedSlicerOption(
-            "automatic supports are not implemented yet",
-        ));
-    }
     if config.hollow {
         return Err(Error::UnsupportedSlicerOption(
             "model hollowing is not implemented yet",
@@ -229,6 +389,50 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
         return Err(Error::UnsupportedSlicerOption(
             "XY contour offset is not implemented yet",
         ));
+    }
+    let supports = &config.supports;
+    for (name, value, allow_zero) in [
+        ("support overhang angle", supports.overhang_angle_deg, false),
+        ("support spacing", supports.spacing_mm, false),
+        ("support tip diameter", supports.tip_diameter_mm, false),
+        ("support trunk diameter", supports.trunk_diameter_mm, false),
+        ("support base diameter", supports.base_diameter_mm, false),
+        ("support tip height", supports.tip_height_mm, false),
+        ("support base height", supports.base_height_mm, true),
+        ("support penetration", supports.penetration_mm, true),
+        ("support minimum height", supports.min_height_mm, true),
+        ("support maximum height", supports.max_height_mm, false),
+    ] {
+        if !value.is_finite() || value < 0.0 || (!allow_zero && value == 0.0) {
+            return Err(Error::InvalidModel(format!("invalid {name}: {value}")));
+        }
+    }
+    if !(1.0..89.0).contains(&supports.overhang_angle_deg) {
+        return Err(Error::InvalidModel(
+            "support overhang angle must be between 1 and 89 degrees".into(),
+        ));
+    }
+    if supports.tip_diameter_mm > supports.trunk_diameter_mm
+        || supports.trunk_diameter_mm > supports.base_diameter_mm
+    {
+        return Err(Error::InvalidModel(
+            "support diameters must satisfy tip <= trunk <= base".into(),
+        ));
+    }
+    if supports.min_height_mm > supports.max_height_mm {
+        return Err(Error::InvalidModel(
+            "support minimum height must not exceed maximum height".into(),
+        ));
+    }
+    let minimum_segments = if supports.shape == SupportShape::Square {
+        3
+    } else {
+        6
+    };
+    if !(minimum_segments..=128).contains(&supports.radial_segments) {
+        return Err(Error::InvalidModel(format!(
+            "support radial segment count must be between {minimum_segments} and 128"
+        )));
     }
     let print = &config.print;
     for (name, value, allow_zero) in [

@@ -99,6 +99,29 @@ pub(crate) fn slice_mesh(mesh: &Mesh, layer_height: f64) -> Result<Vec<LayerSlic
         .collect()
 }
 
+/// Combines independently oriented model/support contours. Keeping the two
+/// winding classifications separate prevents a support inside the model's XY
+/// projection from being mistaken for a hole.
+pub(crate) fn merge_layers(
+    model: &[LayerSlice],
+    supports: &[LayerSlice],
+    layer_height: f64,
+) -> Vec<LayerSlice> {
+    let count = model.len().max(supports.len());
+    (0..count)
+        .map(|index| {
+            let mut contours = Vec::new();
+            if let Some(layer) = model.get(index) {
+                contours.extend(layer.contours.iter().cloned());
+            }
+            if let Some(layer) = supports.get(index) {
+                contours.extend(layer.contours.iter().cloned());
+            }
+            prepare_layer(index as u32, (index as f64 + 0.5) * layer_height, contours)
+        })
+        .collect()
+}
+
 fn intersect_triangle(triangle: Triangle, z: f64) -> Option<[Vec2; 2]> {
     let mut intersections = Vec::<Vec2>::with_capacity(3);
     for edge in [[0, 1], [1, 2], [2, 0]] {

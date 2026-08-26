@@ -17,6 +17,7 @@ This document separates facts confirmed through Ghidra from working conclusions 
 | `VoxSDKTriangleFix.dll`       | confirmed            | Mesh inspection and repair: holes, normals, non-manifold geometry, intersections, shells, and noise shells.                                                                        |
 | `VoxSDKTriangleEdit.dll`      | confirmed            | Plane cutting, shell separation, and a second perforation API.                                                                                                                     |
 | `VoxSDKTriangleLayout2D.dll`  | confirmed            | 2D/2.5D nesting and automatic placement on the build platform.                                                                                                                     |
+| `step_iges_datachange_r.dll`  | confirmed/decompiled | OpenCascade STEP/IGES readers, shape repair/sewing, deterministic BRep tessellation, and flattened vertex/index export.                                                             |
 
 `wrapper_slicer_engine_r.dll` depends only on Qt5Gui/Qt5Core, bcrypt, and system libraries. This is a good indication that the format handling and slicing itself are implemented there rather than hidden inside a network or cloud module.
 
@@ -196,6 +197,38 @@ STL / mesh-3MF / STEP or IGES
 
 STL and the Core mesh/build/component subset of 3MF are read directly. STEP and IGES are tessellated through the installed `gmsh` executable. The latter makes the Linux `.so` independent of the Windows MSVC ABI, but it is currently a runtime dependency for CAD input.
 
+### Original STEP/IGES path confirmed from `step_iges_datachange_r.c`
+
+The newly supplied decompilation resolves the major uncertainty around the
+original CAD conversion path:
+
+| Function | Address | Confirmed behaviour |
+| --- | --- | --- |
+| `StepIgesDataChange::StepIgesDataChange()` | `0x18000ded0` | Stores default linear deflection `0.1` and angular deflection `0.5`; initialises empty vertex/index vectors and the shape holder. |
+| `StepIgesDataChange::OpenFile(std::string,int)` | `0x1800106a0` | Clears old mesh data, selects a CAD reader, transfers roots, then repairs/sews the resulting shape. The zero discriminator follows the STEP branch; the other branch constructs the IGES reader. |
+| STEP reader constructor (`FUN_1803f7d60`) | `0x1803f7d60` | Constructs `STEPControl_Reader`. |
+| IGES reader constructor (`FUN_18013e860`) | `0x18013e860` | Constructs `IGESControl_Reader`; also reads the OpenCascade `read.iges.onlyvisible` option. |
+| shape repair (`FUN_180010ea0`) | `0x180010ea0` | Uses `ShapeFix_Shape`, then `BRepBuilderAPI_Sewing`, and returns the repaired/sewn `TopoDS_Shape`. |
+| `StepIgesDataChange::read()` | `0x180011fc0` | Calls `BRepMesh_IncrementalMesh(shape, 0.1, false, 0.5, false)`, iterates `TopoDS_Face` values, extracts triangulations, and builds flat vertex/index arrays. |
+| `StepIgesDataChange::getVertexs()` | `0x180011fa0` | Returns `vector<tuple<float,float,float>>` by value. |
+| `StepIgesDataChange::getIndices()` | `0x180011f80` | Returns `vector<unsigned int>` by value. |
+| `StepIgesDataChange::set_tolerance(double,double)` | `0x180012b10` | Replaces the two deflection values used by `read()`. |
+
+The `BRepMesh_IncrementalMesh` call is visible directly at
+`step_iges_datachange_r.c` lines around 20550. Its recovered signature matches
+OpenCascade's shape, linear deflection, relative flag, angular deflection, and
+parallel flag ordering. Therefore `0.1` and `0.5` are not unit conversion
+constants: they are absolute chordal and angular meshing tolerances. The
+angular value is in OpenCascade's native radians.
+
+The current independent implementation still uses Gmsh rather than loading the
+proprietary Windows DLL or exposing its MSVC C++ ABI. Gmsh uses its own CAD
+mesher, so identical STEP triangles are not claimed even though final geometry
+and PWSZ layers are deterministic. Exact original tessellation on Linux would
+require a small native OpenCascade adapter using the confirmed call above (and
+the OCCT data-exchange development headers), or an in-memory mesh ABI from the
+host application.
+
 The supplied `MDP-P906.step` test produced:
 
 ```text
@@ -226,6 +259,20 @@ job: 326 layers, 3 previews, 336 ZIP entries, estimated Some(1771) s
 
 * `AnycubicSupport::TreeSupportLibExport::Instance` is created in `mainwindow.c` around lines 280663 and 283769.
 
+The independent Rust implementation now provides a deliberately smaller,
+documented support subsystem. It samples downward-facing triangles on an XY
+grid, finds the highest model surface below each contact (falling back to the
+build plate), filters supports by minimum/maximum height, and emits closed
+tiered solids. Cylinder, tapered, and square shapes plus light/medium/heavy
+presets and explicit manual contact/base points are exposed through CLI, JSON,
+Rust, and the stable C ABI. Model and support meshes are sliced separately and
+their oriented polygons are merged at the layer boundary.
+
+This is an implementation fact about this repository, not evidence that
+Workshop uses the same contact selection. The decompiled VoxSDK proves a much
+broader system (point/bar/line/web/solid/base-plate and tree supports), and the
+field-level preset structures/branching heuristics remain unrecovered.
+
 The decompiled DLLs confirm a specific set of geometry operations:
 
 * `VoxSDKTriangleHollow.dll` exports `VoxApi::TriangleHollow{,WithFilter}::{hollow,hollowWithLattice}` and `setFilterSmallShells`. Parameters include thicknesses, filters, and a callback. The numeric values/enums of `LatticeType` and `FilterType` have not yet been recovered.
@@ -244,17 +291,15 @@ The decompiled DLLs confirm a specific set of geometry operations:
 
 No additional DLL is required to run the current independent default slicer. The following evidence would reduce compatibility risk or is required for feature parity:
 
-1. **`step_iges_datachange_r.dll`** is missing from `anycubic_disassembled`. `mainwindow.dll` function `FUN_1801eea60 @ 0x1801eea60` calls `StepIgesDataChange::{OpenFile,read,getVertexs,getIndices,closefile}` from it. Decompile this DLL to recover Workshop's original STEP/IGES chord tolerance, angular deflection, unit handling, and assembly policy. The current implementation deliberately uses Gmsh instead.
+1. Trace all fields populated in `ModelCalcLayerVolumeInfo` before `FUN_180358c80 @ 0x180358c80`, plus reader `FUN_180351040 @ 0x180351040`. This is needed to reproduce the firmware's adaptive grouping policy rather than the current deterministic approximation.
 
-2. Trace all fields populated in `ModelCalcLayerVolumeInfo` before `FUN_180358c80 @ 0x180358c80`, plus reader `FUN_180351040 @ 0x180351040`. This is needed to reproduce the firmware's adaptive grouping policy rather than the current deterministic approximation.
+2. Supply one fresh PWSZ made by Workshop **4.1.8** from the same `MDP-P906.step`, with supports/hollow/offset disabled and the documented default resin. The present sample identifies itself as Workshop 4.1.5. A matched file allows layer-by-layer differential validation.
 
-3. Supply one fresh PWSZ made by Workshop **4.1.8** from the same `MDP-P906.step`, with supports/hollow/offset disabled and the documented default resin. The present sample identifies itself as Workshop 4.1.5. A matched file allows layer-by-layer differential validation.
+3. Supply small files exercising one feature at a time: one hole, one hollow shell, one manual support, one automatic support, and positive/negative XY compensation. These fixtures are more useful than more bulk decompilation for observable-output tests.
 
-4. Supply small files exercising one feature at a time: one hole, one hollow shell, one manual support, one automatic support, and positive/negative XY compensation. These fixtures are more useful than more bulk decompilation for observable-output tests.
+4. For exact support/hollow parity, continue field reconstruction of `VoxSDKSupportGeneration.dll`, `TreeSupportLib.dll`, `VoxSDKTriangleHollow.dll`, and `AcPerforate.dll`. Their exported MSVC C++ structures are not stable ABIs, so an open implementation can instead use independent algorithms while preserving the final PWSZ contract.
 
-5. For exact support/hollow parity, continue field reconstruction of `VoxSDKSupportGeneration.dll`, `TreeSupportLib.dll`, `VoxSDKTriangleHollow.dll`, and `AcPerforate.dll`. Their exported MSVC C++ structures are not stable ABIs, so an open implementation can instead use independent algorithms while preserving the final PWSZ contract.
-
-6. `mesh_0.vf`, `node_0.nd`, and the project writer are needed only for compatible editable `.pwscene` output, not for printable PWSZ generation.
+5. `mesh_0.vf`, `node_0.nd`, and the project writer are needed only for compatible editable `.pwscene` output, not for printable PWSZ generation.
 
 ## Architectural Implications for Rust and Bambu Studio
 
