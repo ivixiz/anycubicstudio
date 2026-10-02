@@ -25,6 +25,8 @@ pub enum Error {
     Protocol(&'static str),
     #[error("invalid 3D model: {0}")]
     InvalidModel(String),
+    #[error("invalid PCB artwork: {0}")]
+    InvalidArtwork(String),
     #[error("unsupported model format: {0}")]
     UnsupportedModelFormat(String),
     #[error("unsupported slicer option: {0}")]

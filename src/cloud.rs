@@ -12,9 +12,10 @@
 //! must still treat all control methods as active hardware operations.
 
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use md5::{Digest, Md5};
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::commands::validate_builtin_exposure;
 use crate::error::{Error, Result};
 
 /// Legacy production root decoded from `[cloud_api_prod]` in Workshop 4.1.8's
@@ -35,6 +37,13 @@ pub const WORKSHOP_4_1_8_CLOUD_API_ROOT: &str =
 /// and printer list on 2026-08-24.  It is intentionally distinct from the
 /// historical embedded value above.
 pub const CURRENT_CLOUD_API_ROOT: &str = "https://cloud-universe.anycubic.com/p/p/workbench/api";
+
+/// Exact production authorization URL assembled by Photon Workshop 4.1.8.
+///
+/// Login credentials are entered into Anycubic's Casdoor web page.  The native
+/// application never sends the account password to QCloudSDK; it receives an
+/// authorization code through the registered `acpws://login` callback.
+pub const WORKSHOP_OAUTH_AUTHORIZE_URL: &str = "https://uc.makeronline.com/login/oauth/authorize?client_id=25ec844d72180b556acc&response_type=code&scope=read&application=ac_slicer_lcd&redirect_uri=acpws%3A%2F%2Flogin";
 
 // Shared application credentials embedded verbatim in QCloudSDK.dll.  They
 // identify Photon Workshop as an API client; they are not generated from, or
@@ -74,6 +83,82 @@ impl WorkshopAccessToken {
     fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Store the bearer token in a Workshop-compatible INI file without
+    /// printing it. Existing unrelated settings are retained.
+    pub fn save_to_global_config(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        let source = match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let updated = update_cloud_ini(&source, self.as_str());
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(updated.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+}
+
+/// Extract the OAuth code from Workshop's callback URI or accept a raw code.
+/// The returned value is short-lived but must still not be logged.
+pub fn workshop_oauth_code(callback_or_code: &str) -> Result<String> {
+    let value = callback_or_code.trim();
+    if value.is_empty() {
+        return Err(Error::Protocol("empty Workshop OAuth callback/code"));
+    }
+    if value.contains("://") {
+        let url = reqwest::Url::parse(value)
+            .map_err(|_| Error::Protocol("invalid Workshop OAuth callback URI"))?;
+        if url.scheme() != "acpws" || url.host_str() != Some("login") {
+            return Err(Error::Protocol(
+                "OAuth callback must use the acpws://login URI",
+            ));
+        }
+        return url
+            .query_pairs()
+            .find_map(|(name, value)| (name == "code").then(|| value.into_owned()))
+            .filter(|code| !code.is_empty())
+            .ok_or(Error::Protocol("OAuth callback URI has no code parameter"));
+    }
+    if value.chars().any(char::is_whitespace) {
+        return Err(Error::Protocol("OAuth code contains whitespace"));
+    }
+    Ok(value.to_owned())
+}
+
+/// Exchange the Casdoor callback code exactly as `NetworkRequest::AccessToken`
+/// does in Photon Workshop 4.1.8 (`FUN_180141da0 @ 0x180141da0`).
+pub async fn exchange_workshop_oauth_code(callback_or_code: &str) -> Result<WorkshopAccessToken> {
+    let code = workshop_oauth_code(callback_or_code)?;
+    let http = reqwest::Client::builder().https_only(true).build()?;
+    let url = format!("{CURRENT_CLOUD_API_ROOT}/v3/public/getoauthToken");
+    let value: Value = http
+        .post(url)
+        .headers(workshop_headers(None)?)
+        .json(&json!({ "code": code }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let data = value.get("data").unwrap_or(&value);
+    let token = field_as_string(data, &["access_token", "accessToken"])
+        .ok_or_else(|| cloud_error(&value, "OAuth response had no access token"))?;
+    WorkshopAccessToken::new(token)
 }
 
 /// Non-secret fields returned by `GET /work/printer/getPrinters`.  Unknown
@@ -136,6 +221,16 @@ pub struct CloudFile {
     pub parse_status: Option<u64>,
 }
 
+/// Sanitized response from Workshop's `GetSliceStatus(file_id)` request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudFileStatus {
+    pub file_id: u64,
+    pub status: Option<u64>,
+    pub parse_status: Option<u64>,
+    pub progress_percent: Option<u64>,
+    pub reason: Option<String>,
+}
+
 /// Project/job summary returned by `GET /work/project/getProjects`.
 /// Numeric state fields are kept raw until observed on the M7 Pro.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +246,8 @@ pub struct CloudProject {
     pub create_time: Option<u64>,
     pub start_time: Option<u64>,
     pub end_time: Option<u64>,
+    pub fail_reason: Option<String>,
+    pub error_code: Option<u64>,
 }
 
 /// A Cloud command was accepted for delivery to the printer.  Acceptance is
@@ -299,6 +396,66 @@ impl CloudClient {
         self.list_cloud_files_with_token(&token, limit).await
     }
 
+    /// Query the SDK's per-file parsing state. `QCloudSDK.dll` names this
+    /// operation `sliceStatus(unsigned int)` and uses the literal endpoint
+    /// `/work/index/getUploadStatus` with an `id` field.
+    pub async fn cloud_file_status(&self, file_id: u64) -> Result<CloudFileStatus> {
+        let token = self.api_token().await?;
+        let value = self
+            .request_json(
+                "POST",
+                "/work/index/getUploadStatus",
+                None,
+                Some(json!({ "id": file_id })),
+                Some(&token),
+            )
+            .await?;
+        let data = value.get("data").unwrap_or(&value);
+        let data = data
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(data);
+        let response_file_id = field_as_u64(data, &["id", "file_id"]).unwrap_or(file_id);
+        Ok(CloudFileStatus {
+            file_id: response_file_id,
+            status: field_as_u64(data, &["status"]),
+            parse_status: field_as_u64(data, &["is_parse", "slice_status"]),
+            progress_percent: field_as_u64(data, &["progress"]),
+            reason: field_as_string(data, &["reason", "message", "msg", "desc"])
+                .or_else(|| field_as_string(&value, &["reason"])),
+        })
+    }
+
+    /// Query parsed G-code/slice metadata. Photon Workshop calls
+    /// `sliceInfo(unsigned __int64)`; `QCloudSDK.dll` appends `?id=<gcode_id>`
+    /// to the literal `/work/gcode/info` endpoint.
+    pub async fn cloud_slice_info(&self, gcode_id: u64) -> Result<CloudFileStatus> {
+        let token = self.api_token().await?;
+        let id = gcode_id.to_string();
+        let value = self
+            .request_json(
+                "GET",
+                "/work/gcode/info",
+                Some(&[("id", id.as_str())]),
+                None,
+                Some(&token),
+            )
+            .await?;
+        let data = value.get("data").unwrap_or(&value);
+        let data = data
+            .as_array()
+            .and_then(|items| items.first())
+            .unwrap_or(data);
+        Ok(CloudFileStatus {
+            file_id: field_as_u64(data, &["id", "gcode_id"]).unwrap_or(gcode_id),
+            status: field_as_u64(data, &["status"]),
+            parse_status: field_as_u64(data, &["is_parse", "slice_status"]),
+            progress_percent: field_as_u64(data, &["progress"]),
+            reason: field_as_string(data, &["reason", "message", "msg", "desc"])
+                .or_else(|| field_as_string(&value, &["reason"])),
+        })
+    }
+
     async fn list_cloud_files_with_token(&self, token: &str, limit: u64) -> Result<Vec<CloudFile>> {
         let value = self
             .request_json(
@@ -358,7 +515,53 @@ impl CloudClient {
         printer_id: u64,
         cloud_file_id: u64,
     ) -> Result<CloudOrderAck> {
+        self.start_cloud_file_with_settings(
+            printer_id,
+            cloud_file_id,
+            json!({
+                "ai_detect": 0,
+                "camera_timelapse": 0,
+            }),
+            false,
+        )
+        .await
+    }
+
+    /// Start a one-layer PCB PWSZ while explicitly disabling every editable
+    /// M7 Pro preparation/automation flag captured in Photon Workshop's own
+    /// Cloud request. This suppresses automatic resin feed, preprint heating,
+    /// stirring, post-print auto-top and intelligent-release/failure helpers.
+    ///
+    /// It does **not** suppress firmware-controlled homing, levelling, resin
+    /// detection or residue detection. The Cloud describes those checks as
+    /// non-editable, and a normal `order_id = 1` remains a real print start.
+    /// The order is refused unless Cloud reports this printer online and in
+    /// the idle state observed on the tested M7 Pro.
+    pub async fn start_cloud_pcb_print(
+        &self,
+        printer_id: u64,
+        cloud_file_id: u64,
+    ) -> Result<CloudOrderAck> {
+        self.start_cloud_file_with_settings(
+            printer_id,
+            cloud_file_id,
+            pcb_print_task_settings(),
+            true,
+        )
+        .await
+    }
+
+    async fn start_cloud_file_with_settings(
+        &self,
+        printer_id: u64,
+        cloud_file_id: u64,
+        task_settings: Value,
+        require_idle: bool,
+    ) -> Result<CloudOrderAck> {
         let token = self.api_token().await?;
+        if require_idle {
+            self.require_online_idle_printer(&token, printer_id).await?;
+        }
         // Refuse an identifier which is not currently present in this
         // account.  This also catches an upload that has not finished being
         // claimed/parsed before a hardware command is sent.
@@ -370,10 +573,53 @@ impl CloudClient {
             .ok_or(Error::Protocol(
                 "Cloud file id is not present in the current account",
             ))?;
-        if file.parse_status == Some(0) {
-            return Err(Error::Protocol("Cloud file has not finished parsing"));
+        if file.parse_status != Some(1) {
+            return Err(Error::Protocol(
+                "Cloud file has not been parsed successfully",
+            ));
         }
-        self.send_order_with_token(&token, start_cloud_file_payload(cloud_file_id, printer_id))
+        // Delivery may have been requested while Cloud was still converting
+        // the PWSZ. Re-send the now-parsed file before the active START order;
+        // sendFile is idempotent and does not start the printer by itself.
+        self.send_cloud_file_to_printer(&token, cloud_file_id, printer_id)
+            .await?;
+        self.send_order_with_token(
+            &token,
+            start_cloud_file_payload(cloud_file_id, printer_id, task_settings),
+        )
+        .await
+    }
+
+    /// Start a firmware-provided LCD test pattern without starting a print
+    /// project. Workshop selects Cloud order 301 in
+    /// `FUN_1800d7780 @ 0x1800d7780`; the payload contains only
+    /// `exposure_type` and `last_time`.
+    ///
+    /// The command itself has no platform/Z fields. It cannot display a
+    /// caller-provided bitmap or a PWSZ/Gerber layer: only the raw built-in
+    /// pattern values 1, 2 and 4 are confirmed. This client checks the target
+    /// is the single requested online, idle printer before sending it.
+    pub async fn start_cloud_exposure(
+        &self,
+        printer_id: u64,
+        exposure_type: u8,
+        duration_s: u32,
+    ) -> Result<CloudOrderAck> {
+        validate_builtin_exposure(exposure_type, duration_s)?;
+        let token = self.api_token().await?;
+        self.require_online_idle_printer(&token, printer_id).await?;
+        self.send_order_with_token(
+            &token,
+            exposure_control_payload(301, printer_id, i16::from(exposure_type), duration_s),
+        )
+        .await
+    }
+
+    /// Cancel the dedicated LCD test (`order_id = 302`). Cancellation is sent
+    /// without requiring an idle state so it remains usable as a safety stop.
+    pub async fn cancel_cloud_exposure(&self, printer_id: u64) -> Result<CloudOrderAck> {
+        let token = self.api_token().await?;
+        self.send_order_with_token(&token, exposure_control_payload(302, printer_id, -1, 0))
             .await
     }
 
@@ -494,6 +740,32 @@ impl CloudClient {
         })
     }
 
+    async fn require_online_idle_printer(&self, token: &str, printer_id: u64) -> Result<()> {
+        let printers = self
+            .list_at_path("/work/printer/getPrinters", token)
+            .await?;
+        let printer_id_text = printer_id.to_string();
+        let printer = printers
+            .iter()
+            .find(|printer| printer.id.as_deref() == Some(printer_id_text.as_str()))
+            .ok_or(Error::Protocol(
+                "printer id is not present in the current account",
+            ))?;
+        if printer.device_status != Some(1) {
+            return Err(Error::Protocol(
+                "refusing active command: Cloud does not report the printer online",
+            ));
+        }
+        // These raw values were captured from the target M7 Pro: 1 is idle,
+        // 2 is active. Fail closed for absent/new states instead of guessing.
+        if printer.is_printing != Some(1) {
+            return Err(Error::Protocol(
+                "refusing active command: target M7 Pro is not in the observed idle state",
+            ));
+        }
+        Ok(())
+    }
+
     /// Upload a prepared PWSZ archive to Cloud storage and request Cloud-side
     /// delivery to a specific printer.  This implements the sequence observed
     /// in the bundled Cloud SDK and independently corroborated by the current
@@ -502,7 +774,8 @@ impl CloudClient {
     /// 1. `lockStorageSpace` returns a one-time `preSignUrl` and lock id;
     /// 2. the bytes are PUT to that URL;
     /// 3. `newUploadFile` claims the uploaded object as a Cloud file;
-    /// 4. `sendFile` receives `{file_id, printer_ids}`.
+    /// 4. wait until Cloud reports `parse_status = 1` for the claimed file;
+    /// 5. `sendFile` receives `{file_id, printer_ids}`.
     ///
     /// The method deliberately does **not** submit a remote start order.  It
     /// is suitable only for a job already checked against the target model.
@@ -548,6 +821,8 @@ impl CloudClient {
         let cloud_file_id = transfer_result?;
         unlock_result?;
 
+        self.wait_for_cloud_file_parse(&token, cloud_file_id)
+            .await?;
         self.send_cloud_file_to_printer(&token, cloud_file_id, printer_id)
             .await?;
         Ok(CloudFileTransfer {
@@ -670,6 +945,33 @@ impl CloudClient {
         Ok(())
     }
 
+    async fn wait_for_cloud_file_parse(&self, token: &str, cloud_file_id: u64) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 30;
+        for attempt in 0..MAX_ATTEMPTS {
+            let file = self
+                .list_cloud_files_with_token(token, 50)
+                .await?
+                .into_iter()
+                .find(|file| file.id == cloud_file_id);
+            if let Some(file) = file {
+                if file.parse_status == Some(1) {
+                    return Ok(());
+                }
+                // Live observations: accepted files settle at status=1 / parse=1,
+                // while ENGINE_ABNORMAL jobs settle at status=3 / parse=0.
+                if file.status == Some(3) {
+                    return Err(Error::Cloud(format!(
+                        "Cloud parser rejected uploaded PWSZ file {cloud_file_id}"
+                    )));
+                }
+            }
+            if attempt + 1 < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        Err(Error::Timeout("Cloud PWSZ parsing"))
+    }
+
     async fn request_json(
         &self,
         method: &str,
@@ -708,20 +1010,43 @@ impl CloudClient {
         );
         let signature = format!("{:x}", Md5::digest(signature_source.as_bytes()));
 
-        let mut headers = HeaderMap::new();
-        insert_header(&mut headers, "XX-Device-Type", "pc")?;
-        insert_header(&mut headers, "XX-IS-CN", "1")?;
-        insert_header(&mut headers, "XX-Nonce", &nonce)?;
-        insert_header(&mut headers, "XX-Signature", &signature)?;
-        insert_header(&mut headers, "XX-Timestamp", &timestamp)?;
-        insert_header(&mut headers, "XX-Version", CLIENT_VERSION)?;
-        insert_header(&mut headers, "XX-LANGUAGE", "US")?;
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(api_token) = api_token {
-            insert_header(&mut headers, "XX-Token", api_token)?;
-        }
-        Ok(headers)
+        signed_headers(&timestamp, &nonce, &signature, api_token)
     }
+}
+
+fn workshop_headers(api_token: Option<&str>) -> Result<HeaderMap> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string();
+    let nonce = Uuid::new_v4().hyphenated().to_string();
+    let signature_source = format!(
+        "{WORKSHOP_APP_ID}{timestamp}{CLIENT_VERSION}{WORKSHOP_APP_SECRET}{nonce}{WORKSHOP_APP_ID}"
+    );
+    let signature = format!("{:x}", Md5::digest(signature_source.as_bytes()));
+    signed_headers(&timestamp, &nonce, &signature, api_token)
+}
+
+fn signed_headers(
+    timestamp: &str,
+    nonce: &str,
+    signature: &str,
+    api_token: Option<&str>,
+) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    insert_header(&mut headers, "XX-Device-Type", "pc")?;
+    insert_header(&mut headers, "XX-IS-CN", "1")?;
+    insert_header(&mut headers, "XX-Nonce", nonce)?;
+    insert_header(&mut headers, "XX-Signature", signature)?;
+    insert_header(&mut headers, "XX-Timestamp", timestamp)?;
+    insert_header(&mut headers, "XX-Version", CLIENT_VERSION)?;
+    insert_header(&mut headers, "XX-LANGUAGE", "US")?;
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(api_token) = api_token {
+        insert_header(&mut headers, "XX-Token", api_token)?;
+    }
+    Ok(headers)
 }
 
 impl CloudFile {
@@ -752,6 +1077,17 @@ impl CloudProject {
             create_time: field_as_u64(value, &["create_time"]),
             start_time: field_as_u64(value, &["start_time"]),
             end_time: field_as_u64(value, &["end_time"]),
+            fail_reason: field_as_string(
+                value,
+                &[
+                    "fail_reason",
+                    "failReason",
+                    "failure_reason",
+                    "reason",
+                    "message",
+                ],
+            ),
+            error_code: field_as_u64(value, &["error_code", "errorCode", "fail_code"]),
         })
     }
 }
@@ -801,6 +1137,61 @@ fn required_string(value: &Value, field: &str, fallback: &'static str) -> Result
     field_as_string(value, &[field]).ok_or(Error::Protocol(fallback))
 }
 
+fn update_cloud_ini(source: &str, access_token: &str) -> String {
+    let mut output = Vec::<String>::new();
+    let mut in_cloud = false;
+    let mut saw_cloud = false;
+    let mut wrote_token = false;
+    let mut wrote_login_state = false;
+
+    let finish_cloud =
+        |output: &mut Vec<String>, wrote_token: &mut bool, wrote_login_state: &mut bool| {
+            if !*wrote_login_state {
+                output.push("loginState=true".to_owned());
+                *wrote_login_state = true;
+            }
+            if !*wrote_token {
+                output.push(format!("accessToken={access_token}"));
+                *wrote_token = true;
+            }
+        };
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_cloud {
+                finish_cloud(&mut output, &mut wrote_token, &mut wrote_login_state);
+            }
+            in_cloud = trimmed.eq_ignore_ascii_case("[Cloud]");
+            saw_cloud |= in_cloud;
+            output.push(line.trim_end_matches('\r').to_owned());
+            continue;
+        }
+        if in_cloud && trimmed.starts_with("accessToken=") {
+            output.push(format!("accessToken={access_token}"));
+            wrote_token = true;
+        } else if in_cloud && trimmed.starts_with("loginState=") {
+            output.push("loginState=true".to_owned());
+            wrote_login_state = true;
+        } else {
+            output.push(line.trim_end_matches('\r').to_owned());
+        }
+    }
+    if in_cloud {
+        finish_cloud(&mut output, &mut wrote_token, &mut wrote_login_state);
+    } else if !saw_cloud {
+        if !output.is_empty() && output.last().is_some_and(|line| !line.is_empty()) {
+            output.push(String::new());
+        }
+        output.push("[Cloud]".to_owned());
+        output.push("loginState=true".to_owned());
+        output.push(format!("accessToken={access_token}"));
+    }
+    let mut result = output.join("\n");
+    result.push('\n');
+    result
+}
+
 fn send_file_payload(cloud_file_id: u64, printer_id: u64) -> Value {
     json!({
         "file_id": cloud_file_id,
@@ -808,7 +1199,7 @@ fn send_file_payload(cloud_file_id: u64, printer_id: u64) -> Value {
     })
 }
 
-fn start_cloud_file_payload(cloud_file_id: u64, printer_id: u64) -> Value {
+fn start_cloud_file_payload(cloud_file_id: u64, printer_id: u64, task_settings: Value) -> Value {
     json!({
         "order_id": 1,
         "printer_id": printer_id,
@@ -817,10 +1208,7 @@ fn start_cloud_file_payload(cloud_file_id: u64, printer_id: u64) -> Value {
             "filetype": 0,
             "file_key": "",
             "file_name": "",
-            "task_settings": {
-                "ai_detect": 0,
-                "camera_timelapse": 0,
-            },
+            "task_settings": task_settings,
             "file_id": cloud_file_id,
             "hollow_param": null,
             "is_delete_file": 0,
@@ -836,12 +1224,49 @@ fn start_cloud_file_payload(cloud_file_id: u64, printer_id: u64) -> Value {
     })
 }
 
+fn pcb_print_task_settings() -> Value {
+    // Exact keys and value shape captured from Photon Workshop 4.1.8's
+    // order_id=1 request for the target M7 Pro. The persistent printer-status
+    // response marks these as editable; levelling/resin/residual are omitted
+    // because that same response marks them editable=0.
+    json!({
+        "autoTop": 0,
+        "dynamicRelease": 0,
+        "failDetection": 0,
+        "offLightCompensation": 0,
+        "resinAutoLoad": 0,
+        "resinHeat": 0,
+        "stir_settings": {
+            "stirTime": 0,
+        },
+    })
+}
+
 fn project_control_payload(order_id: u64, printer_id: u64, project_id: u64) -> Value {
     json!({
         "order_id": order_id,
         "printer_id": printer_id,
         "project_id": project_id,
         "data": null,
+        "ams_info": null,
+        "settings": null,
+    })
+}
+
+fn exposure_control_payload(
+    order_id: u64,
+    printer_id: u64,
+    exposure_type: i16,
+    last_time: u32,
+) -> Value {
+    json!({
+        "order_id": order_id,
+        "printer_id": printer_id,
+        "project_id": 0,
+        "data": {
+            "exposure_type": exposure_type,
+            "last_time": last_time,
+        },
         "ams_info": null,
         "settings": null,
     })
@@ -890,6 +1315,31 @@ mod tests {
         let token = WorkshopAccessToken::new("token").unwrap();
         assert_eq!(token.as_str(), "token");
         assert!(WorkshopAccessToken::new("  ").is_err());
+    }
+
+    #[test]
+    fn parses_workshop_oauth_callback_without_accepting_another_scheme() {
+        assert_eq!(
+            workshop_oauth_code("acpws://login?code=abc%2D123").unwrap(),
+            "abc-123"
+        );
+        assert_eq!(workshop_oauth_code("raw-code").unwrap(), "raw-code");
+        assert!(workshop_oauth_code("https://example.com/?code=nope").is_err());
+        assert!(workshop_oauth_code("   ").is_err());
+    }
+
+    #[test]
+    fn updates_only_the_cloud_login_fields_in_an_ini() {
+        let source = "[Cloud]\r\nloginState=false\r\nuserName=kept\r\naccessToken=old\r\n[Layout]\r\nvalue=1\r\n";
+        let updated = update_cloud_ini(source, "new-secret");
+        assert!(updated.contains("loginState=true\n"));
+        assert!(updated.contains("userName=kept\n"));
+        assert!(updated.contains("accessToken=new-secret\n"));
+        assert!(updated.contains("[Layout]\nvalue=1\n"));
+        assert!(!updated.contains("accessToken=old"));
+
+        let created = update_cloud_ini("", "token");
+        assert_eq!(created, "[Cloud]\nloginState=true\naccessToken=token\n");
     }
 
     #[test]
@@ -963,7 +1413,11 @@ mod tests {
     #[test]
     fn start_and_stop_payloads_keep_file_and_project_ids_distinct() {
         assert_eq!(
-            start_cloud_file_payload(86140277, 609126),
+            start_cloud_file_payload(
+                86140277,
+                609126,
+                json!({"ai_detect": 0, "camera_timelapse": 0}),
+            ),
             json!({
                 "order_id": 1,
                 "printer_id": 609126,
@@ -1000,6 +1454,52 @@ mod tests {
         );
         assert_eq!(project_control_payload(2, 609126, 42)["order_id"], 2);
         assert_eq!(project_control_payload(3, 609126, 42)["order_id"], 3);
+    }
+
+    #[test]
+    fn pcb_start_disables_only_confirmed_editable_preparation_features() {
+        assert_eq!(
+            pcb_print_task_settings(),
+            json!({
+                "autoTop": 0,
+                "dynamicRelease": 0,
+                "failDetection": 0,
+                "offLightCompensation": 0,
+                "resinAutoLoad": 0,
+                "resinHeat": 0,
+                "stir_settings": {"stirTime": 0}
+            })
+        );
+        let payload = start_cloud_file_payload(99, 609126, pcb_print_task_settings());
+        assert_eq!(payload["data"]["task_settings"]["resinAutoLoad"], 0);
+        assert!(payload["data"]["task_settings"].get("levelling").is_none());
+        assert!(payload["data"]["task_settings"].get("residual").is_none());
+    }
+
+    #[test]
+    fn exposure_payloads_match_workshop_control_orders() {
+        assert_eq!(
+            exposure_control_payload(301, 609126, 2, 60),
+            json!({
+                "order_id": 301,
+                "printer_id": 609126,
+                "project_id": 0,
+                "data": {"exposure_type": 2, "last_time": 60},
+                "ams_info": null,
+                "settings": null
+            })
+        );
+        assert_eq!(
+            exposure_control_payload(302, 609126, -1, 0),
+            json!({
+                "order_id": 302,
+                "printer_id": 609126,
+                "project_id": 0,
+                "data": {"exposure_type": -1, "last_time": 0},
+                "ams_info": null,
+                "settings": null
+            })
+        );
     }
 
     #[test]

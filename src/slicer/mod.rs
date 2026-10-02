@@ -7,6 +7,7 @@
 mod ffi;
 mod geometry;
 mod mesh;
+pub mod pcb;
 mod render;
 mod support;
 mod viewer_scene;
@@ -207,6 +208,23 @@ pub struct SlicerConfig {
     pub gmsh_path: PathBuf,
 }
 
+/// One independently transformed and supported model in a multi-model plate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneModelConfig {
+    pub input: PathBuf,
+    pub transform: Transform,
+    pub supports: SupportConfig,
+}
+
+/// Serializable plate description used by the GUI and host applications.
+/// Machine/print settings are shared while every model retains its own
+/// transform and support profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SceneProject {
+    pub config: SlicerConfig,
+    pub models: Vec<SceneModelConfig>,
+}
+
 impl Default for SlicerConfig {
     fn default() -> Self {
         Self {
@@ -282,6 +300,27 @@ pub fn slice_file(
     })
 }
 
+/// Slices every model in a GUI/project plate into one PWSZ job.
+pub fn slice_project(project: &SceneProject, output: impl AsRef<Path>) -> Result<SliceReport> {
+    let output = output.as_ref();
+    let scene = prepare_project(project)?;
+    let input = &project
+        .models
+        .first()
+        .ok_or_else(|| Error::InvalidModel("scene project contains no models".into()))?
+        .input;
+    write_pwsz(
+        output,
+        input,
+        &project.config,
+        &scene.model,
+        &scene.supports,
+        &scene.layers,
+        scene.volume_mm3,
+    )?;
+    slice_report(&scene, output)
+}
+
 /// Exports transformed triangles, generated supports, and every sliced contour
 /// to the compact binary scene consumed by the Qt/OpenGL viewer.
 pub fn export_viewer_scene(
@@ -301,12 +340,91 @@ pub fn export_viewer_scene(
     })
 }
 
+/// Exports a combined multi-model plate for sliced-layer inspection.
+pub fn export_project_viewer_scene(
+    project: &SceneProject,
+    output: impl AsRef<Path>,
+) -> Result<ViewerSceneReport> {
+    let output = output.as_ref();
+    let scene = prepare_project(project)?;
+    write_viewer_scene(
+        output,
+        &project.config,
+        &scene.model,
+        &scene.supports,
+        &scene.layers,
+    )?;
+    viewer_report(&scene, output)
+}
+
+fn slice_report(scene: &PreparedScene, output: &Path) -> Result<SliceReport> {
+    Ok(SliceReport {
+        triangle_count: scene.combined.triangles.len(),
+        model_triangle_count: scene.model.triangles.len(),
+        support_triangle_count: scene.supports.triangles.len(),
+        support_count: scene.support_count,
+        layer_count: scene.layers.len() as u32,
+        bounds_mm: scene.bounds,
+        estimated_volume_ml: scene.volume_mm3 / 1000.0,
+        output_bytes: std::fs::metadata(output)?.len(),
+    })
+}
+
+fn viewer_report(scene: &PreparedScene, output: &Path) -> Result<ViewerSceneReport> {
+    Ok(ViewerSceneReport {
+        model_triangle_count: scene.model.triangles.len(),
+        support_triangle_count: scene.supports.triangles.len(),
+        support_count: scene.support_count,
+        layer_count: scene.layers.len() as u32,
+        output_bytes: std::fs::metadata(output)?.len(),
+    })
+}
+
 fn prepare_scene(input: &Path, config: &SlicerConfig) -> Result<PreparedScene> {
-    validate_config(config)?;
-    let mut model = Mesh::load(input, &config.gmsh_path)?;
-    model.apply_transform(&config.transform)?;
-    let generated_supports = generate_supports(&model, &config.supports)?;
-    let supports = generated_supports.mesh;
+    prepare_project(&SceneProject {
+        config: config.clone(),
+        models: vec![SceneModelConfig {
+            input: input.to_owned(),
+            transform: config.transform.clone(),
+            supports: config.supports.clone(),
+        }],
+    })
+}
+
+fn prepare_project(project: &SceneProject) -> Result<PreparedScene> {
+    if project.models.is_empty() {
+        return Err(Error::InvalidModel(
+            "scene project contains no models".into(),
+        ));
+    }
+    let mut model = Mesh {
+        triangles: Vec::new(),
+    };
+    let mut supports = Mesh {
+        triangles: Vec::new(),
+    };
+    let mut support_count = 0;
+    for instance in &project.models {
+        let mut instance_config = project.config.clone();
+        instance_config.transform = instance.transform.clone();
+        instance_config.supports = instance.supports.clone();
+        validate_config(&instance_config)?;
+        let mut instance_mesh = Mesh::load(&instance.input, &instance_config.gmsh_path)?;
+        instance_mesh.apply_transform(&instance_config.transform)?;
+        let generated = generate_supports(&instance_mesh, &instance_config.supports)?;
+        support_count += generated.count;
+        model.triangles.extend(instance_mesh.triangles);
+        supports.triangles.extend(generated.mesh.triangles);
+    }
+    prepare_loaded_scene(model, supports, support_count, &project.config)
+}
+
+fn prepare_loaded_scene(
+    model: Mesh,
+    supports: Mesh,
+    support_count: usize,
+    config: &SlicerConfig,
+) -> Result<PreparedScene> {
     let mut mesh = model.clone();
     mesh.triangles.extend_from_slice(&supports.triangles);
     let (minimum, maximum) = mesh.bounds();
@@ -371,7 +489,7 @@ fn prepare_scene(input: &Path, config: &SlicerConfig) -> Result<PreparedScene> {
         supports,
         combined: mesh,
         layers,
-        support_count: generated_supports.count,
+        support_count,
         bounds: [
             minimum.x, minimum.y, minimum.z, maximum.x, maximum.y, maximum.z,
         ],
@@ -388,6 +506,28 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
     if config.xy_offset_mm != 0.0 {
         return Err(Error::UnsupportedSlicerOption(
             "XY contour offset is not implemented yet",
+        ));
+    }
+    if config
+        .machine
+        .build_volume_mm
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(Error::InvalidModel(
+            "machine build-volume dimensions must be finite and positive".into(),
+        ));
+    }
+    if config.machine.resolution.contains(&0)
+        || config
+            .machine
+            .pixel_size_um
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        || config.machine.max_segments_per_layer == 0
+    {
+        return Err(Error::InvalidModel(
+            "machine resolution, pixel size, and segment limit must be positive".into(),
         ));
     }
     let supports = &config.supports;
@@ -407,7 +547,7 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
             return Err(Error::InvalidModel(format!("invalid {name}: {value}")));
         }
     }
-    if !(1.0..89.0).contains(&supports.overhang_angle_deg) {
+    if supports.overhang_angle_deg <= 1.0 || supports.overhang_angle_deg >= 89.0 {
         return Err(Error::InvalidModel(
             "support overhang angle must be between 1 and 89 degrees".into(),
         ));

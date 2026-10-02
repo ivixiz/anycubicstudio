@@ -7,7 +7,14 @@ set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 
-qt_add_executable(anycubic-viewer main.cpp)
+qt_add_executable(anycubic-viewer
+    main.cpp
+    main_window.cpp
+    main_window.hpp
+    print_view.cpp
+    print_view.hpp
+    scene.cpp
+    scene.hpp)
 target_link_libraries(anycubic-viewer PRIVATE
     Qt6::Widgets
     Qt6::OpenGL
@@ -15,4 +22,3 @@ target_link_libraries(anycubic-viewer PRIVATE
 
 set_target_properties(anycubic-viewer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../target/release")
-

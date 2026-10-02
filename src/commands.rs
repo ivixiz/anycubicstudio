@@ -3,7 +3,31 @@
 
 use serde_json::{Value, json};
 
+use crate::error::{Error, Result};
 use crate::protocol::{CommandEnvelope, start_print_data};
+
+/// Exposure modes accepted by Workshop's dedicated LCD-test command.
+/// Their visual meaning is deliberately left unnamed: the decompiled desktop
+/// client proves the raw values 1, 2 and 4, but not stable human-readable
+/// names across printer firmware versions.
+pub const BUILTIN_EXPOSURE_TYPES: [u8; 3] = [1, 2, 4];
+
+/// Safety policy of this client, not a firmware/protocol limit.
+pub const CLIENT_MAX_EXPOSURE_SECONDS: u32 = 300;
+
+pub(crate) fn validate_builtin_exposure(exposure_type: u8, duration_s: u32) -> Result<()> {
+    if !BUILTIN_EXPOSURE_TYPES.contains(&exposure_type) {
+        return Err(Error::Protocol(
+            "exposure type must be one of the confirmed raw values 1, 2 or 4",
+        ));
+    }
+    if !(1..=CLIENT_MAX_EXPOSURE_SECONDS).contains(&duration_s) {
+        return Err(Error::Protocol(
+            "exposure duration must be 1..=300 seconds (client safety limit)",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct Command {
@@ -84,6 +108,34 @@ impl Command {
         }
     }
 
+    /// Start the printer's built-in LCD exposure test without entering the
+    /// normal print path. Confirmed by `FUN_1800e1720 @ 0x1800e1720` and
+    /// `FUN_1800d5ee0` in Workshop 4.1.8.
+    ///
+    /// This command selects one of three firmware-provided test patterns. It
+    /// cannot carry a custom bitmap, PWSZ layer or Gerber image.
+    pub fn exposure_start(exposure_type: u8, duration_s: u32) -> Result<Self> {
+        validate_builtin_exposure(exposure_type, duration_s)?;
+        Ok(Self {
+            message_type: "exposure",
+            action: "start",
+            data: json!({
+                "exposure_type": exposure_type,
+                "last_time": duration_s,
+            }),
+        })
+    }
+
+    /// Cancel the dedicated LCD exposure test. The scalar `0` payload is the
+    /// exact cancel branch serialized by `FUN_1800e1720 @ 0x1800e1720`.
+    pub fn exposure_cancel() -> Self {
+        Self {
+            message_type: "exposure",
+            action: "cancel",
+            data: json!(0),
+        }
+    }
+
     /// Start data has confirmed field names, but the numeric/string semantics
     /// of `task_mode`, `filetype`, and `project_type` are not yet established.
     /// They are caller-provided rather than guessed.
@@ -124,5 +176,30 @@ impl Command {
             action: "query",
             data: Value::Null,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exposure_commands_match_confirmed_mqtt_shape() {
+        let start = Command::exposure_start(2, 60).unwrap();
+        assert_eq!(start.message_type, "exposure");
+        assert_eq!(start.action, "start");
+        assert_eq!(start.data, json!({"exposure_type": 2, "last_time": 60}));
+
+        let cancel = Command::exposure_cancel();
+        assert_eq!(cancel.message_type, "exposure");
+        assert_eq!(cancel.action, "cancel");
+        assert_eq!(cancel.data, json!(0));
+    }
+
+    #[test]
+    fn exposure_command_rejects_unknown_or_unsafe_values() {
+        assert!(Command::exposure_start(3, 60).is_err());
+        assert!(Command::exposure_start(1, 0).is_err());
+        assert!(Command::exposure_start(4, 301).is_err());
     }
 }

@@ -1,23 +1,118 @@
 //! Diagnostic CLI for LAN discovery, PWSZ inspection and Anycubic Cloud.
-//! `cloud-start`, `cloud-pause`, `cloud-resume` and `cloud-stop` are active
-//! hardware commands; discovery, inspection and list commands are read-only.
+//! `cloud-start`, project control and `cloud-exposure-*` are active hardware
+//! commands; discovery, inspection and list commands are read-only.
 //!
 //! With no arguments it sends the exact SSDP discovery request. To fetch an
 //! advertised endpoint, pass both its host and port, e.g.
 //! `cargo run -- 192.168.0.101 18910`.  The port is intentionally not guessed.
 //! To inspect a print job locally, use `cargo run -- pwsz path/to/file.pwsz`.
 
-use std::time::Duration;
+use std::{
+    io::{self, Read, Write},
+    time::Duration,
+};
 
-use anycubicstudio::cloud::CloudClient;
+use anycubicstudio::cloud::{
+    CloudClient, WORKSHOP_OAUTH_AUTHORIZE_URL, exchange_workshop_oauth_code,
+};
 use anycubicstudio::discovery::{discover, fetch_location_info};
 use anycubicstudio::pwsz::PwszArchive;
-use anycubicstudio::slicer::{SlicerConfig, SupportConfig, SupportShape};
+use anycubicstudio::slicer::pcb::{DrillMode, PcbExposureConfig};
+use anycubicstudio::slicer::{SceneProject, SlicerConfig, SupportConfig, SupportShape};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut arguments = std::env::args().skip(1);
     let host = arguments.next();
+    if host.as_deref() == Some("gui") {
+        let viewer = locate_viewer()?;
+        let status = std::process::Command::new(&viewer)
+            .args(arguments)
+            .status()
+            .map_err(|error| {
+                anyhow::anyhow!("could not start GUI {}: {error}", viewer.display())
+            })?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("GUI exited with {status}"));
+        }
+        return Ok(());
+    }
+    if matches!(
+        host.as_deref(),
+        Some("project-slice") | Some("project-viewer-scene")
+    ) {
+        let operation = host.as_deref().expect("matched project operation");
+        let project_path = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>")
+        })?;
+        let output = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>")
+        })?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>"
+            ));
+        }
+        let project: SceneProject = serde_json::from_slice(&std::fs::read(project_path)?)?;
+        if operation == "project-slice" {
+            let report = anycubicstudio::slicer::slice_project(&project, output)?;
+            println!(
+                "Created project PWSZ: {} model + {} support triangles ({} supports), {} layers, {:.3} ml, {} bytes",
+                report.model_triangle_count,
+                report.support_triangle_count,
+                report.support_count,
+                report.layer_count,
+                report.estimated_volume_ml,
+                report.output_bytes,
+            );
+        } else {
+            let report = anycubicstudio::slicer::export_project_viewer_scene(&project, output)?;
+            println!(
+                "Created project viewer scene: {} model + {} support triangles ({} supports), {} layers, {} bytes",
+                report.model_triangle_count,
+                report.support_triangle_count,
+                report.support_count,
+                report.layer_count,
+                report.output_bytes,
+            );
+        }
+        return Ok(());
+    }
+    if matches!(
+        host.as_deref(),
+        Some("pcb-slice") | Some("pcb-viewer-scene")
+    ) {
+        let operation = host.as_deref().expect("matched PCB operation");
+        let (gerbers, drills, output, config) = parse_pcb_arguments(arguments, operation)?;
+        let report = if operation == "pcb-slice" {
+            anycubicstudio::slicer::pcb::slice_pcb(&gerbers, &drills, &output, &config)?
+        } else {
+            anycubicstudio::slicer::pcb::export_pcb_viewer_scene(
+                &gerbers, &drills, &output, &config,
+            )?
+        };
+        println!(
+            "Created {}: {} Gerber + {} drill file(s), {:.3} s exposure, {} lit pixels, {} contours / {} segments, {:.3} mm², {} bytes; bounds {:?} mm",
+            if operation == "pcb-slice" {
+                "one-layer PCB PWSZ"
+            } else {
+                "PCB viewer scene"
+            },
+            report.gerber_files,
+            report.drill_files,
+            report.exposure_s,
+            report.exposed_pixels,
+            report.contour_count,
+            report.segment_count,
+            report.exposed_area_mm2,
+            report.output_bytes,
+            report.bounds_mm,
+        );
+        for warning in report.warnings {
+            eprintln!("PCB warning: {warning}");
+        }
+        return Ok(());
+    }
     if host.as_deref() == Some("slice") {
         let (input, output, config) = parse_slice_arguments(arguments)?;
         let report = anycubicstudio::slicer::slice_file(input, output, &config)?;
@@ -89,6 +184,82 @@ async fn main() -> anyhow::Result<()> {
             ));
         }
         std::fs::write(path, serde_json::to_vec_pretty(&SlicerConfig::default())?)?;
+        return Ok(());
+    }
+    if host.as_deref() == Some("pcb-default-config") {
+        let path = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!("usage: anycubicstudio pcb-default-config <output.json>")
+        })?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio pcb-default-config <output.json>"
+            ));
+        }
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&PcbExposureConfig::default())?,
+        )?;
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-login-url") {
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!("usage: anycubicstudio cloud-login-url"));
+        }
+        println!("{WORKSHOP_OAUTH_AUTHORIZE_URL}");
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-login-complete") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-login-complete <CONFIG.ini> [acpws-callback-or-code]"
+            )
+        })?;
+        let supplied_callback = arguments.next();
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-login-complete <CONFIG.ini> [acpws-callback-or-code]"
+            ));
+        }
+        let callback = match supplied_callback {
+            Some(callback) => callback,
+            None => {
+                let mut callback = String::new();
+                io::stdin().read_to_string(&mut callback)?;
+                callback.trim().to_owned()
+            }
+        };
+        let token = exchange_workshop_oauth_code(&callback).await?;
+        token.save_to_global_config(&config)?;
+        println!(
+            "Anycubic OAuth login completed; access token saved to {config}. The token was not printed."
+        );
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-login") {
+        let config = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("usage: anycubicstudio cloud-login <CONFIG.ini>"))?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-login <CONFIG.ini>"
+            ));
+        }
+        println!(
+            "Opening Anycubic's OAuth page. Enter the account credentials only in that web page."
+        );
+        if let Err(error) = open_authorization_page() {
+            eprintln!("Could not open a browser automatically: {error}");
+            println!("Open this URL manually:\n{WORKSHOP_OAUTH_AUTHORIZE_URL}");
+        }
+        eprint!("Paste the final acpws://login?... address (or its code) here: ");
+        io::stderr().flush()?;
+        let mut callback = String::new();
+        io::stdin().read_line(&mut callback)?;
+        let token = exchange_workshop_oauth_code(callback.trim()).await?;
+        token.save_to_global_config(&config)?;
+        println!(
+            "Anycubic OAuth login completed; access token saved to {config}. The password and token were not printed."
+        );
         return Ok(());
     }
     if matches!(
@@ -216,7 +387,7 @@ async fn main() -> anyhow::Result<()> {
         println!("Cloud returned {} recent project(s).", projects.len());
         for project in projects {
             println!(
-                "project id={}, task_id={:?}, printer_id={:?}, gcode_id={:?}, name={:?}, progress={:?}, print_status={:?}, status={:?}, create={:?}, start={:?}, end={:?}",
+                "project id={}, task_id={:?}, printer_id={:?}, gcode_id={:?}, name={:?}, progress={:?}, print_status={:?}, status={:?}, create={:?}, start={:?}, end={:?}, fail_reason={:?}, error_code={:?}",
                 project.id,
                 project.task_id,
                 project.printer_id,
@@ -228,8 +399,66 @@ async fn main() -> anyhow::Result<()> {
                 project.create_time,
                 project.start_time,
                 project.end_time,
+                project.fail_reason,
+                project.error_code,
             );
         }
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-file-status") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-file-status <Workshop-global_config.ini> <cloud-file-id>"
+            )
+        })?;
+        let file_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-file-status requires a cloud file id"))?
+            .parse()?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-file-status <Workshop-global_config.ini> <cloud-file-id>"
+            ));
+        }
+        let status = CloudClient::from_global_config(config)?
+            .cloud_file_status(file_id)
+            .await?;
+        println!(
+            "file id={}, status={:?}, parse_status={:?}, progress={:?}, reason={:?}",
+            status.file_id,
+            status.status,
+            status.parse_status,
+            status.progress_percent,
+            status.reason,
+        );
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-slice-info") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-slice-info <Workshop-global_config.ini> <gcode-id>"
+            )
+        })?;
+        let gcode_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-slice-info requires a gcode id"))?
+            .parse()?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-slice-info <Workshop-global_config.ini> <gcode-id>"
+            ));
+        }
+        let status = CloudClient::from_global_config(config)?
+            .cloud_slice_info(gcode_id)
+            .await?;
+        println!(
+            "gcode id={}, status={:?}, parse_status={:?}, progress={:?}, reason={:?}",
+            status.file_id,
+            status.status,
+            status.parse_status,
+            status.progress_percent,
+            status.reason,
+        );
         return Ok(());
     }
     if host.as_deref() == Some("cloud-projects") {
@@ -241,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
         println!("Cloud returned {} recent project(s).", projects.len());
         for project in projects {
             println!(
-                "project id={}, task_id={:?}, printer_id={:?}, gcode_id={:?}, name={:?}, progress={:?}, print_status={:?}, status={:?}, create={:?}, start={:?}, end={:?}",
+                "project id={}, task_id={:?}, printer_id={:?}, gcode_id={:?}, name={:?}, progress={:?}, print_status={:?}, status={:?}, create={:?}, start={:?}, end={:?}, fail_reason={:?}, error_code={:?}",
                 project.id,
                 project.task_id,
                 project.printer_id,
@@ -253,6 +482,8 @@ async fn main() -> anyhow::Result<()> {
                 project.create_time,
                 project.start_time,
                 project.end_time,
+                project.fail_reason,
+                project.error_code,
             );
         }
         return Ok(());
@@ -275,6 +506,90 @@ async fn main() -> anyhow::Result<()> {
         let ack = cloud.start_cloud_print(printer_id, cloud_file_id).await?;
         println!(
             "Cloud accepted START_PRINT for file {cloud_file_id} on printer {printer_id}; msgid={}",
+            ack.message_id
+        );
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-start-pcb") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-start-pcb <Workshop-global_config.ini> <printer-id> <cloud-file-id>"
+            )
+        })?;
+        let printer_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-start-pcb requires a printer id"))?
+            .parse()?;
+        let cloud_file_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-start-pcb requires a cloud file id"))?
+            .parse()?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-start-pcb <Workshop-global_config.ini> <printer-id> <cloud-file-id>"
+            ));
+        }
+        let ack = CloudClient::from_global_config(config)?
+            .start_cloud_pcb_print(printer_id, cloud_file_id)
+            .await?;
+        println!(
+            "Cloud accepted PCB START_PRINT for file {cloud_file_id} on printer {printer_id}; msgid={}. Editable auto-feed/heating/stirring/intelligent functions were disabled, but normal firmware homing/checks may still move Z.",
+            ack.message_id
+        );
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-exposure-start") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-exposure-start <Workshop-global_config.ini> <printer-id> <raw-pattern:1|2|4> <seconds:1..300>"
+            )
+        })?;
+        let printer_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-exposure-start requires a printer id"))?
+            .parse()?;
+        let exposure_type = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-exposure-start requires pattern 1, 2 or 4"))?
+            .parse()?;
+        let duration_s = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-exposure-start requires duration in seconds"))?
+            .parse()?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-exposure-start <Workshop-global_config.ini> <printer-id> <raw-pattern:1|2|4> <seconds:1..300>"
+            ));
+        }
+        let ack = CloudClient::from_global_config(config)?
+            .start_cloud_exposure(printer_id, exposure_type, duration_s)
+            .await?;
+        println!(
+            "Cloud accepted motion-free built-in LCD exposure pattern {exposure_type} for {duration_s} s on printer {printer_id}; msgid={}. This command does not display a PWSZ/Gerber image.",
+            ack.message_id
+        );
+        return Ok(());
+    }
+    if host.as_deref() == Some("cloud-exposure-stop") {
+        let config = arguments.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "usage: anycubicstudio cloud-exposure-stop <Workshop-global_config.ini> <printer-id>"
+            )
+        })?;
+        let printer_id = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cloud-exposure-stop requires a printer id"))?
+            .parse()?;
+        if arguments.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "usage: anycubicstudio cloud-exposure-stop <Workshop-global_config.ini> <printer-id>"
+            ));
+        }
+        let ack = CloudClient::from_global_config(config)?
+            .cancel_cloud_exposure(printer_id)
+            .await?;
+        println!(
+            "Cloud accepted dedicated LCD exposure cancel for printer {printer_id}; msgid={}",
             ack.message_id
         );
         return Ok(());
@@ -477,6 +792,9 @@ fn parse_slice_arguments(
             "--support-base-height" => {
                 config.supports.base_height_mm = value(&mut arguments)?.parse()?
             }
+            "--support-penetration" => {
+                config.supports.penetration_mm = value(&mut arguments)?.parse()?
+            }
             "--support-max-height" => {
                 config.supports.max_height_mm = value(&mut arguments)?.parse()?
             }
@@ -502,6 +820,9 @@ fn parse_slice_arguments(
             "--exposure" => config.print.exposure_s = value(&mut arguments)?.parse()?,
             "--lift-height" => config.print.lift_height_mm = value(&mut arguments)?.parse()?,
             "--lift-speed" => config.print.lift_speed_mm_s = value(&mut arguments)?.parse()?,
+            "--build-volume" => {
+                config.machine.build_volume_mm = parse_triplet(&value(&mut arguments)?)?
+            }
             "--move" => config.transform.translation_mm = parse_triplet(&value(&mut arguments)?)?,
             "--rotate" => config.transform.rotation_deg = parse_triplet(&value(&mut arguments)?)?,
             "--scale" => config.transform.scale = parse_triplet(&value(&mut arguments)?)?,
@@ -517,6 +838,78 @@ fn parse_slice_arguments(
     Ok((input, output, config))
 }
 
+fn parse_pcb_arguments(
+    mut arguments: impl Iterator<Item = String>,
+    operation: &str,
+) -> anyhow::Result<(
+    Vec<std::path::PathBuf>,
+    Vec<std::path::PathBuf>,
+    String,
+    PcbExposureConfig,
+)> {
+    let first_gerber = arguments
+        .next()
+        .ok_or_else(|| anyhow::anyhow!(pcb_usage(operation)))?;
+    let output = arguments
+        .next()
+        .ok_or_else(|| anyhow::anyhow!(pcb_usage(operation)))?;
+    let mut gerbers = vec![std::path::PathBuf::from(first_gerber)];
+    let mut drills = Vec::new();
+    let mut config = PcbExposureConfig::default();
+    let mut save_config = None;
+
+    while let Some(option) = arguments.next() {
+        let value = |arguments: &mut dyn Iterator<Item = String>| {
+            arguments
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("{option} requires a value"))
+        };
+        match option.as_str() {
+            "--gerber" => gerbers.push(value(&mut arguments)?.into()),
+            "--drill" => drills.push(value(&mut arguments)?.into()),
+            "--config" => {
+                config = serde_json::from_slice(&std::fs::read(value(&mut arguments)?)?)?;
+            }
+            "--save-config" => save_config = Some(value(&mut arguments)?),
+            "--exposure" => config.exposure_s = value(&mut arguments)?.parse()?,
+            "--layer-height" => config.layer_height_mm = value(&mut arguments)?.parse()?,
+            "--lift-height" => config.lift_height_mm = value(&mut arguments)?.parse()?,
+            "--lift-speed" => config.lift_speed_mm_s = value(&mut arguments)?.parse()?,
+            "--move" => config.offset_mm = parse_pair(&value(&mut arguments)?)?,
+            "--rotate" => config.rotation_deg = value(&mut arguments)?.parse()?,
+            "--scale" => config.scale = value(&mut arguments)?.parse()?,
+            "--mirror-x" => config.mirror_x = true,
+            "--mirror-y" => config.mirror_y = true,
+            "--invert" => config.invert = true,
+            "--no-invert" => config.invert = false,
+            "--invert-margin" => config.invert_margin_mm = value(&mut arguments)?.parse()?,
+            "--simplify" => config.simplify_tolerance_mm = value(&mut arguments)?.parse()?,
+            "--drill-mode" => {
+                config.drill_mode = match value(&mut arguments)?.as_str() {
+                    "clear" => DrillMode::Clear,
+                    "expose" => DrillMode::Expose,
+                    "ignore" => DrillMode::Ignore,
+                    mode => {
+                        return Err(anyhow::anyhow!(
+                            "unknown drill mode {mode}; expected clear, expose or ignore"
+                        ));
+                    }
+                }
+            }
+            "--build-volume" => {
+                config.machine.build_volume_mm = parse_triplet(&value(&mut arguments)?)?
+            }
+            "--help" | "-h" => return Err(anyhow::anyhow!(pcb_usage(operation))),
+            unknown => return Err(anyhow::anyhow!("unknown PCB option {unknown}")),
+        }
+    }
+
+    if let Some(path) = save_config {
+        std::fs::write(path, serde_json::to_vec_pretty(&config)?)?;
+    }
+    Ok((gerbers, drills, output, config))
+}
+
 fn enabled_supports(mut supports: SupportConfig) -> SupportConfig {
     supports.enabled = true;
     supports
@@ -525,6 +918,11 @@ fn enabled_supports(mut supports: SupportConfig) -> SupportConfig {
 fn parse_triplet(value: &str) -> anyhow::Result<[f64; 3]> {
     let values = parse_numbers(value, 3, 3)?;
     Ok([values[0], values[1], values[2]])
+}
+
+fn parse_pair(value: &str) -> anyhow::Result<[f64; 2]> {
+    let values = parse_numbers(value, 2, 2)?;
+    Ok([values[0], values[1]])
 }
 
 fn parse_numbers(value: &str, minimum: usize, maximum: usize) -> anyhow::Result<Vec<f64>> {
@@ -547,7 +945,46 @@ fn parse_numbers(value: &str, minimum: usize, maximum: usize) -> anyhow::Result<
 }
 
 fn slice_usage() -> &'static str {
-    "usage: anycubicstudio slice <MODEL> <OUTPUT.pwsz> [--config FILE] [--save-config FILE] [--supports none|light|medium|heavy] [--support-auto on|off] [--support-shape cylinder|tapered|square] [--support-spacing MM] [--support-angle DEG] [--support-tip MM] [--support-trunk MM] [--support-base MM] [--support-tip-height MM] [--support-base-height MM] [--support-min-height MM] [--support-max-height MM] [--support-segments N] [--manual-support X,Y,Z[,BASE_Z]] [--layer-height MM] [--bottom-layers N] [--bottom-exposure SEC] [--exposure SEC] [--lift-height MM] [--lift-speed MM_S] [--move X,Y,Z] [--rotate X,Y,Z] [--scale X,Y,Z] [--no-center] [--no-place-on-bed]"
+    "usage: anycubicstudio slice <MODEL> <OUTPUT.pwsz> [--config FILE] [--save-config FILE] [--supports none|light|medium|heavy] [--support-auto on|off] [--support-shape cylinder|tapered|square] [--support-spacing MM] [--support-angle DEG] [--support-tip MM] [--support-trunk MM] [--support-base MM] [--support-tip-height MM] [--support-base-height MM] [--support-penetration MM] [--support-min-height MM] [--support-max-height MM] [--support-segments N] [--manual-support X,Y,Z[,BASE_Z]] [--layer-height MM] [--bottom-layers N] [--bottom-exposure SEC] [--exposure SEC] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z] [--move X,Y,Z] [--rotate X,Y,Z] [--scale X,Y,Z] [--no-center] [--no-place-on-bed]"
+}
+
+fn pcb_usage(operation: &str) -> String {
+    format!(
+        "usage: anycubicstudio {operation} <GERBER> <OUTPUT> [--gerber FILE] [--drill FILE] [--config FILE] [--save-config FILE] [--exposure SEC] [--drill-mode clear|expose|ignore] [--invert] [--mirror-x] [--mirror-y] [--rotate DEG] [--scale FACTOR] [--move X,Y] [--invert-margin MM] [--simplify MM] [--layer-height MM] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z]"
+    )
+}
+
+fn open_authorization_page() -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("rundll32");
+        command
+            .arg("url.dll,FileProtocolHandler")
+            .arg(WORKSHOP_OAUTH_AUTHORIZE_URL);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(WORKSHOP_OAUTH_AUTHORIZE_URL);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(WORKSHOP_OAUTH_AUTHORIZE_URL);
+        command
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    return Err(anyhow::anyhow!(
+        "automatic browser launch is unsupported on this platform"
+    ));
+
+    #[cfg(any(target_os = "windows", target_os = "macos", unix))]
+    {
+        command.spawn()?;
+        Ok(())
+    }
 }
 
 fn locate_viewer() -> anyhow::Result<std::path::PathBuf> {

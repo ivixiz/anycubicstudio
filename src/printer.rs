@@ -51,6 +51,18 @@ impl Printer {
         self.send(Command::stop()).await
     }
 
+    /// Run one of the printer firmware's built-in LCD test patterns. Unlike
+    /// `print/start`, the command itself contains no Z-axis operation.
+    pub async fn start_exposure(&self, exposure_type: u8, duration_s: u32) -> Result<String> {
+        self.send(Command::exposure_start(exposure_type, duration_s)?)
+            .await
+    }
+
+    /// Cancel a dedicated LCD exposure test.
+    pub async fn cancel_exposure(&self) -> Result<String> {
+        self.send(Command::exposure_cancel()).await
+    }
+
     pub async fn send(&self, command: Command) -> Result<String> {
         let envelope = command.envelope();
         let msgid = envelope.msgid.clone();

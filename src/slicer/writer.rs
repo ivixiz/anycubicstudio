@@ -9,9 +9,14 @@ use flate2::{Compression, write::ZlibEncoder};
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-use crate::Result;
+use crate::{Error, Result};
 
-use super::{SlicerConfig, geometry::LayerSlice, mesh::Mesh, render::render_previews};
+use super::{
+    SlicerConfig,
+    geometry::LayerSlice,
+    mesh::{Mesh, Vec3},
+    render::{RenderedImage, render_previews},
+};
 
 const OUTER_MAGIC: u32 = 0x003d_3d7b; // "{==\0"
 const OUTER_FOOTER: u32 = 0x007d_3d3d; // "==}\0"
@@ -29,12 +34,30 @@ pub(crate) fn write_pwsz(
     layers: &[LayerSlice],
     volume_mm3: f64,
 ) -> Result<()> {
+    let previews = render_previews(model, supports);
+    write_pwsz_with_previews(
+        output, input, config, model, supports, layers, volume_mm3, &previews, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_pwsz_with_previews(
+    output: &Path,
+    input: &Path,
+    config: &SlicerConfig,
+    model: &Mesh,
+    supports: &Mesh,
+    layers: &[LayerSlice],
+    volume_mm3: f64,
+    previews: &[RenderedImage],
+    pcb_mode: bool,
+) -> Result<()> {
     let mut archive = ZipWriter::new(File::create(output)?);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     write_json(
         &mut archive,
         "anycubic_photon_resins.pwsp",
-        &machine_profile(config),
+        &machine_profile(config, pcb_mode)?,
         options,
     )?;
     write_json(
@@ -55,7 +78,7 @@ pub(crate) fn write_pwsz(
         options,
     )?;
 
-    for (index, rendered) in render_previews(model, supports).into_iter().enumerate() {
+    for (index, rendered) in previews.iter().enumerate() {
         let preview = encode_png(rendered.width, rendered.height, &rendered.rgba)?;
         write_member(
             &mut archive,
@@ -101,92 +124,131 @@ pub(crate) fn write_pwsz(
     Ok(())
 }
 
-fn machine_profile(config: &SlicerConfig) -> Value {
+fn machine_profile(config: &SlicerConfig, pcb_mode: bool) -> Result<Value> {
     let machine = &config.machine;
     let print = &config.print;
-    let resin_name = "Anycubic@abs_like_resin_v2@ACF@normal_print";
-    json!({
-        "version": "3",
-        "machine_type": {
-            "version": "3",
-            "name": machine.name,
-            "key_suffix": "pwsz",
-            "key_image_format": "pwszImg",
-            "res_x": machine.resolution[0],
-            "res_y": machine.resolution[1],
-            "xy_pixel": machine.pixel_size_um[0],
-            "xy_pixel_y": machine.pixel_size_um[1],
-            "rotate_z": 0.0,
-            "max_samples": 16,
-            "property": 119,
-            "print_xsize": machine.build_volume_mm[0],
-            "print_ysize": machine.build_volume_mm[1],
-            "print_zsize": machine.build_volume_mm[2],
-            "max_file_version": 518,
-            "prev_back_color": [0.0078125, 0.28125, 0.390625],
-            "prev_model_color": [0.8046875, 0.8046875, 0.8046875],
-            "prev_supports_color": [0.07421875, 0.92578125, 0.9296875],
-            "prev_image_size": [224, 168],
-            "child_screen": [{"x":0,"y":0,"width":machine.resolution[0],"height":machine.resolution[1]}],
-            "prev2_back_color": [0.07843, 0.10588, 0.16078],
-            "prev2_image_size": [336, 252],
-            "raster_segments_capacity": machine.max_segments_per_layer,
-            "raster_antialiasing": 4,
-            "cloudprev_back_color": [0.93333334, 0.9411765, 0.9647059],
-            "cloudprev_imag_size": [800, 600],
-            "print_platform_zheights": [0.0]
-        },
-        "machine_extern": {
-            "version": "3",
-            "alias": machine.name,
-            "picture": "",
-            "device_cn_code": "",
-            "cloud_property": 0,
-            "active_resins": [resin_name],
-            "factory_resins": [],
-            "user_resins": [{
-                "version": "2",
-                "property": {
-                    "version":"4", "code":"19", "currency":print.currency,
-                    "price":print.resin_price, "type":"ABS-like Resin V2",
-                    "volume":print.resin_volume_ml, "subfunc_code":0,
-                    "density":print.resin_density_g_ml, "target_temperature":25.0,
-                    "brand_name":"Anycubic", "resin_name":"abs_like_resin_v2",
-                    "film_name":"ACF", "setting_name":"normal_print", "name":resin_name
-                },
-                "depth_penetration_curve": {
-                    "zthick_min":0.01, "zthick_max":0.2, "light_intensity":9000.0,
-                    "safety_coefficient":1.6, "current_tempcurve_selector":0,
-                    "temperature_coefficients":[]
-                },
-                "slice_extpara": {
-                    "version":"3", "multi_state_used":0, "transition_layercount":15,
-                    "transition_type":0, "exposure_compensate":0.0, "intelli_mode":1,
-                    "max_acceleration":20.0, "separate_support_exposure_delayed":0.0,
-                    "material_scale_coeffs":[], "material_scale_coeffs_mode":0,
-                    "material_scale_xyz":{"x":1.0,"y":1.0,"z":1.0}
-                },
-                "slicepara": {
-                    "anti_count":1, "blur_level":0, "bott_layers":print.bottom_layers,
-                    "bott_time":print.bottom_exposure_s, "bott_time_dual":print.bottom_exposure_s,
-                    "exposure_time":print.exposure_s, "gray_level":0,
-                    "off_time":print.off_time_s, "use_indivi_layerpara":0,
-                    "use_random_erode":0, "zdown_speed":print.lift_speed_mm_s,
-                    "zthick":print.layer_height_mm, "zup_height":print.lift_height_mm,
-                    "zup_speed":print.lift_speed_mm_s, "wait_before_lift":0.0,
-                    "wait_after_lift":0.0, "bott_off_time":30.0,
-                    "bott_wait_before_lift":0.0, "bott_wait_after_lift":0.0
-                }
-            }],
-            "firmware_calc_exp_time_paras": {
-                "precision_range_branch":[0.0,5.0,25.0], "precision_per_volume":5.0,
-                "precision_coeff_value":[0.024,0.01,-0.2], "energy_coeff":0.0,
-                "machine_exposure_ton":0.4
-            },
-            "firmware_calc_print_time": 0,
-            "firmware_calc_print_time_paras": {"version":"2"}
-        }
-    })
+    // Cloud's slicing engine rejects a syntactically valid but abbreviated
+    // profile with ENGINE_ABNORMAL.  Preserve the complete M7 Pro factory
+    // profile recovered from a Workshop 4.1.8 job and update only values that
+    // belong to this slice.  In particular, the resin catalogue and firmware
+    // timing tables are not optional even though the printer consumes neither
+    // of them directly from an already-rasterised PWSZ.
+    let mut profile: Value =
+        serde_json::from_str(include_str!("../../assets/m7_pro_factory_profile.pwsp"))?;
+
+    set_profile_value(&mut profile, "/machine_type/name", json!(machine.name))?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/res_x",
+        json!(machine.resolution[0]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/res_y",
+        json!(machine.resolution[1]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/xy_pixel",
+        json!(machine.pixel_size_um[0]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/xy_pixel_y",
+        json!(machine.pixel_size_um[1]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/print_xsize",
+        json!(machine.build_volume_mm[0]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/print_ysize",
+        json!(machine.build_volume_mm[1]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/print_zsize",
+        json!(machine.build_volume_mm[2]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/child_screen",
+        json!([{
+            "x": 0,
+            "y": 0,
+            "width": machine.resolution[0],
+            "height": machine.resolution[1]
+        }]),
+    )?;
+    set_profile_value(
+        &mut profile,
+        "/machine_type/raster_segments_capacity",
+        json!(machine.max_segments_per_layer),
+    )?;
+    set_profile_value(&mut profile, "/machine_extern/alias", json!(machine.name))?;
+
+    let property = "/machine_extern/user_resins/0/property";
+    set_profile_value(
+        &mut profile,
+        &format!("{property}/currency"),
+        json!(print.currency),
+    )?;
+    set_profile_value(
+        &mut profile,
+        &format!("{property}/price"),
+        json!(print.resin_price),
+    )?;
+    set_profile_value(
+        &mut profile,
+        &format!("{property}/volume"),
+        json!(print.resin_volume_ml),
+    )?;
+    set_profile_value(
+        &mut profile,
+        &format!("{property}/density"),
+        json!(print.resin_density_g_ml),
+    )?;
+
+    let slice = "/machine_extern/user_resins/0/slicepara";
+    for (field, value) in [
+        ("bott_layers", json!(print.bottom_layers)),
+        ("bott_time", json!(print.bottom_exposure_s)),
+        ("bott_time_dual", json!(print.bottom_exposure_s)),
+        ("bott_off_time", json!(print.off_time_s)),
+        ("bott_wait_before_lift", json!(0.0)),
+        ("bott_wait_after_lift", json!(0.0)),
+        ("exposure_time", json!(print.exposure_s)),
+        ("off_time", json!(print.off_time_s)),
+        ("zdown_speed", json!(print.lift_speed_mm_s)),
+        ("zthick", json!(print.layer_height_mm)),
+        ("zup_height", json!(print.lift_height_mm)),
+        ("zup_speed", json!(print.lift_speed_mm_s)),
+    ] {
+        set_profile_value(&mut profile, &format!("{slice}/{field}"), value)?;
+    }
+
+    if pcb_mode {
+        // `intelli_mode` is the slice-profile counterpart of intelligent
+        // release. Keep normal resin jobs unchanged, but do not ask firmware
+        // to adapt release behaviour for a one-layer PCB mask.
+        set_profile_value(
+            &mut profile,
+            "/machine_extern/user_resins/0/slice_extpara/intelli_mode",
+            json!(0),
+        )?;
+    }
+
+    Ok(profile)
+}
+
+fn set_profile_value(profile: &mut Value, pointer: &str, value: Value) -> Result<()> {
+    let target = profile.pointer_mut(pointer).ok_or(Error::Protocol(
+        "bundled M7 Pro profile is missing a required field",
+    ))?;
+    *target = value;
+    Ok(())
 }
 
 fn print_info(config: &SlicerConfig, layers: &[LayerSlice], volume_mm3: f64) -> Value {
@@ -290,7 +352,51 @@ pub(crate) fn encode_layer(layer: &LayerSlice) -> Vec<u8> {
 }
 
 fn encode_scene(model: &Mesh, supports: &Mesh, layers: &[LayerSlice]) -> Vec<u8> {
-    let (mut minimum, mut maximum) = model.bounds();
+    let mut mesh_points = model.triangles.iter().flat_map(|triangle| triangle.0);
+    let mesh_bounds = mesh_points.next().map(|first| {
+        mesh_points.fold((first, first), |(minimum, maximum), point| {
+            (
+                Vec3 {
+                    x: minimum.x.min(point.x),
+                    y: minimum.y.min(point.y),
+                    z: minimum.z.min(point.z),
+                },
+                Vec3 {
+                    x: maximum.x.max(point.x),
+                    y: maximum.y.max(point.y),
+                    z: maximum.z.max(point.z),
+                },
+            )
+        })
+    });
+    let (mut minimum, mut maximum) = mesh_bounds.unwrap_or_else(|| {
+        let bounds = layers
+            .iter()
+            .fold(None, |combined: Option<[f64; 4]>, layer| {
+                Some(match combined {
+                    None => layer.bounds,
+                    Some(current) => [
+                        current[0].min(layer.bounds[0]),
+                        current[1].min(layer.bounds[1]),
+                        current[2].max(layer.bounds[2]),
+                        current[3].max(layer.bounds[3]),
+                    ],
+                })
+            })
+            .unwrap_or([0.0; 4]);
+        (
+            Vec3 {
+                x: bounds[0],
+                y: bounds[1],
+                z: 0.0,
+            },
+            Vec3 {
+                x: bounds[2],
+                y: bounds[3],
+                z: layers.last().map_or(0.0, |layer| layer.z),
+            },
+        )
+    });
     if !supports.triangles.is_empty() {
         let (support_minimum, support_maximum) = supports.bounds();
         minimum.x = minimum.x.min(support_minimum.x);

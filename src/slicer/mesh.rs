@@ -217,10 +217,10 @@ impl Mesh {
         if transform
             .scale
             .iter()
-            .any(|value| !value.is_finite() || *value <= 0.0)
+            .any(|value| !value.is_finite() || *value == 0.0)
         {
             return Err(Error::InvalidModel(
-                "all scale values must be finite and greater than zero".into(),
+                "all scale values must be finite and non-zero".into(),
             ));
         }
         let (min, max) = self.bounds();
@@ -267,6 +267,11 @@ impl Mesh {
             point.x += base_translation.x + transform.translation_mm[0];
             point.y += base_translation.y + transform.translation_mm[1];
             point.z += base_translation.z + transform.translation_mm[2];
+        }
+        if transform.scale.iter().product::<f64>() < 0.0 {
+            for triangle in &mut self.triangles {
+                triangle.0.swap(1, 2);
+            }
         }
         Ok(())
     }
@@ -633,5 +638,22 @@ mod tests {
         assert_eq!(mesh.triangles.len(), 1);
         assert_eq!(mesh.triangles[0].0[0].x, 20.0);
         assert_eq!(mesh.triangles[0].0[1].x, 30.0);
+    }
+
+    #[test]
+    fn mirroring_repairs_triangle_winding() {
+        let mut mesh = Mesh::read_stl_bytes(
+            b"solid x\nfacet normal 0 0 1\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid\n",
+        )
+        .unwrap();
+        let transform = Transform {
+            scale: [-1.0, 1.0, 1.0],
+            ..Transform::default()
+        };
+        mesh.apply_transform(&transform).unwrap();
+        let points = mesh.triangles[0].0;
+        let cross_z = (points[1].x - points[0].x) * (points[2].y - points[0].y)
+            - (points[1].y - points[0].y) * (points[2].x - points[0].x);
+        assert!(cross_z > 0.0);
     }
 }

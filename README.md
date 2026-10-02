@@ -7,7 +7,12 @@ The project supports two independent communication paths:
 * **Anycubic Cloud:** printer and file listing, status retrieval, PWSZ upload, print start, pause, resume, and cancellation;
 * **Local network:** SSDP discovery, HTTP bootstrap, and MQTT/TLS commands and reports.
 
-> **Warning:** `cloud-start`, `cloud-pause`, `cloud-resume`, `cloud-stop`, and MQTT control commands operate real hardware. Before running them, make sure the file model matches the printer, the resin vat and build platform are installed correctly, and all mechanical movement is safe.
+> **Warning:** `cloud-start`, `cloud-start-pcb`, `cloud-exposure-start`,
+> `cloud-pause`, `cloud-resume`, `cloud-stop`, and MQTT control commands operate
+> real hardware. A one-layer file with zero lift does **not** disable the
+> firmware's initial Z homing and non-editable checks. Remove the build
+> platform before using `cloud-start-pcb` for photoresist work, and protect
+> eyes and skin from UV.
 
 ## Current Status
 
@@ -21,16 +26,24 @@ The project supports two independent communication paths:
 | Pause/resume, `order_id = 2/3`       | Confirmed from Workshop code and an external implementation; not sent to the test printer |
 | Automatic active-project resolution  | Fail-closed: requires exactly one known active project                                     |
 | LAN SSDP/bootstrap/MQTT              | Implemented based on Workshop 4.1.8; test M7 Pro did not advertise the LAN API            |
-| Standalone browser-based OAuth login | Not yet implemented; currently uses the token from an installed Workshop instance         |
+| Standalone browser-based OAuth login | Implemented with Workshop's browser authorization-code flow; passwords are never accepted by this program |
 | STL and Core mesh-3MF slicing        | Implemented natively in Rust; structurally validated PWSZ                                 |
 | STEP/STP/IGES slicing                | Implemented through Gmsh tessellation; tested with `example.step`                         |
 | Automatic/manual vertical supports   | Light/medium/heavy presets, three pillar shapes, CLI/JSON/Rust/C configuration             |
 | PWSZ rendered previews               | Three real software-rendered views: 224×168, 336×252, and 800×600                          |
-| 3D and sliced-layer viewer           | Qt 6/OpenGL viewer with model/support visibility, camera, zoom, and layer slider           |
+| Graphical plate editor               | Qt 6/OpenGL multi-model GUI: drag/drop, selection, transform/mirror/layout, supports and M7 Pro build volume |
+| GUI slicing and printer workflow     | 3D slice/upload/start and PCB slice/upload with a separate guarded start; status, pause/resume/stop through the Rust CLI |
+| Gerber + Excellon PCB exposure       | Native M7-resolution composition, exact LCD preview and Cloud-parseable one-layer PWSZ; a normal start was observed to move Z |
+| Built-in LCD service exposure        | Order 301/302 and firmware patterns 1/2/4 implemented; cannot display a caller-provided Gerber bitmap |
 | `libanycubicstudio.so` C ABI         | Builds and exports configuration, slicing, and explicit manual-support functions           |
-| Generated PWSZ on physical printer   | Not tested yet; `calc_layer_volumes.data` adaptive grouping remains experimental            |
+| Generated PWSZ compatibility         | Generated PCB PWSZ uploaded and parsed by Anycubic Cloud; normal start reached the printer and was cancelled after observed Z motion |
 
-During a live test, `example.pwsz` was uploaded, parsed by the Cloud, started, and cancelled after 64 seconds. The project transitioned to `print_status = 3`, progress remained at zero, and the printer subsequently reported the idle state again.
+During a live test, the original `example.pwsz` was uploaded, parsed by the
+Cloud, started, and cancelled after 64 seconds. A newly generated PCB PWSZ was
+also accepted by the Cloud. Starting that one-layer file through the normal
+print path caused platform/Z preparation despite zero configured lift, so it
+was cancelled. This is why the GUI no longer starts PCB jobs immediately after
+upload.
 
 ## Requirements
 
@@ -46,6 +59,316 @@ Project verification:
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
+```
+
+## Graphical plate editor and printer control
+
+Build both the Rust engine and the Qt 6 frontend, then start the complete GUI:
+
+```bash
+cargo build --release
+cmake -S viewer -B viewer/build -DCMAKE_BUILD_TYPE=Release
+cmake --build viewer/build --parallel
+target/release/anycubicstudio gui
+```
+
+Models may also be supplied at startup:
+
+```bash
+target/release/anycubicstudio gui model.stl enclosure.step parts.3mf
+```
+
+`ANYCUBICSTUDIO_CLI=/absolute/path/to/anycubicstudio` can be set when the Qt
+executable and Rust executable are installed in different directories. The GUI
+never reimplements slicing or Cloud packets in C++: it invokes the Rust
+executable directly with `QProcess`, without a command shell. The bottom
+`Rust API output` dock shows the exact operation and its result.
+
+### Plate workflow
+
+1. Press the single `Import…` action, pass files on the command line, or drag
+   them into the window. It accepts STL, mesh-3MF, STEP/STP, IGES/IGS, Gerber
+   and Excellon DRL. The GUI classifies the input and selects the 3D or PCB
+   pipeline automatically. CAD formats use Gmsh exactly as the headless Rust
+   API does.
+2. Select a model in `Models on plate`. The selected model is orange; other
+   models are teal and supports are blue.
+3. In `Transform`, configure Move, Rotate, positive scale magnitude, and the
+   independent X/Y/Z Mirror switches, then press `Apply transform`. `Center
+   X/Y`, `Place on bed`, and `Reset transform` are shortcuts. Mirror is encoded
+   as a signed scale in the Rust project and triangle winding is corrected.
+4. `Auto layout` places the centres of imported objects on non-overlapping
+   shelf rows with a 5 mm margin. It refuses the operation if the current
+   bounds do not fit the configured plate. It is a deterministic basic layout,
+   not yet a polygon nesting optimiser.
+5. Configure supports for the selected object on the `Supports` tab. None,
+   Light, Medium, and Heavy presets fill the editable shape, overhang angle,
+   spacing, contact, trunk, base, height, penetration, and radial-segment
+   fields. `Automatic placement` can be disabled for manual
+   `X,Y,Z[,BASE_Z]` contact points. Press `Apply supports and rebuild` to ask
+   the Rust engine for a new preview.
+6. In `Print & zone`, configure the build volume, layer/exposure and lift
+   values. The default volume is the recovered Photon Mono M7 Pro profile:
+   **223.642 × 126.480 × 230 mm**, 13312 × 5120 pixels. The bed grid and the
+   complete three-dimensional volume outline are rendered in the 3D view.
+7. Configure `Printer/Cloud`. For 3D input, `Slice & Run…` writes the PWSZ,
+   uploads it and asks for final confirmation before starting. For Gerber/DRL,
+   the same action is renamed `Slice & Upload…`; it writes and uploads the
+   one-layer PWSZ but deliberately does not start it. After physically removing
+   the platform, use the separate guarded PCB start button. After slicing,
+   `Sliced layer` displays the exact contours.
+
+3D models and PCB artwork cannot be combined in one print job: a resin model
+has many height layers, while a PCB exposure deliberately has one stationary
+layer. If both types are loaded, `Slice & Run…` fails closed and asks the user
+to remove one type instead of silently choosing one.
+
+Camera controls in 3D mode:
+
+| Input | Action |
+| --- | --- |
+| left drag | orbit |
+| Shift + left drag | pan |
+| middle or right drag | pan |
+| mouse wheel | zoom |
+| `Reset camera` | reset orbit, zoom, and pan |
+
+Switching between `Sliced layer` and `3D model & supports` explicitly restores
+the OpenGL depth state. Front surfaces therefore remain opaque instead of
+showing rear/internal faces after the `QPainter` layer view has been used.
+
+Any geometry, support, printing-zone, or exposure change invalidates the
+previous PWSZ and its Cloud file ID. `Slice & Run…`/`Slice & Upload…` always
+rebuilds the job before upload, preventing a stale file from being printed by
+mistake.
+
+### GUI Cloud workflow
+
+On `Printer/Cloud`, select Photon Workshop's `global_config.ini` and enter the
+numeric Cloud printer ID returned by `cloud-status`. You may set
+`ANYCUBIC_CONFIG` to prefill the configuration path. The file path is logged,
+but its token contents are never displayed by the GUI.
+
+The primary GUI action is deliberately unified:
+
+| GUI action | Rust command | Effect |
+| --- | --- | --- |
+| `Slice & Run…` with 3D input | `project-slice` → `cloud-upload` → `cloud-start` | Rebuild, upload and start after confirmation |
+| `Slice & Upload…` with Gerber/DRL | `pcb-slice` → `cloud-upload` | Create and deliver a one-layer job without moving the printer |
+| `Start uploaded PCB (platform removed)…` | `cloud-start-pcb` | Start the last uploaded PCB with all confirmed editable preparation flags disabled |
+| `Run built-in LCD test…` / `STOP LCD test` | `cloud-exposure-start` / `cloud-exposure-stop` | Motion-free firmware test pattern; not the imported Gerber image |
+| `Printer status` | `cloud-status-detail <CONFIG>` | Read-only Cloud state |
+| `Pause` / `Resume` | `cloud-pause` / `cloud-resume` | Resolves one active project safely, then controls it |
+| `Stop` | `cloud-stop <CONFIG> <PRINTER_ID>` | Resolves and cancels one active project after confirmation |
+
+The GUI extracts `CLOUD_FILE_ID` from the successful upload response, so no
+file, G-code or project ID is copied manually. The upload happens before the
+final start confirmation; cancelling that confirmation leaves an uploaded
+Cloud file but does not send a start command. Pause/resume/stop use the
+fail-closed active-project resolver described below. Closing a progress dialog
+terminates the local Rust subprocess; after a network interruption, always
+read printer status before repeating an active operation. For local-only PWSZ
+creation without upload/start, use the explicit `slice`, `project-slice`, or
+`pcb-slice` CLI command.
+
+The GUI currently provides numeric transforms rather than an on-model gizmo,
+and manual support contacts are entered as coordinates rather than picked with
+a ray cast. Support geometry is the independent vertical-pillar engine
+documented below, not Workshop/VoxSDK tree support parity.
+
+## PCB photoresist exposure from KiCad Gerber and drill files
+
+The Rust engine can compose one or more RS-274X Gerber files with one or more
+Excellon drill files at the native **13312 × 5120** LCD resolution of the
+Photon Mono M7 Pro. It then traces the final raster back into the vector
+`pwszImg` representation and creates a normal PWSZ with exactly one layer. The
+default layer/bottom exposure is **60 seconds** and the default configured lift
+is zero.
+
+This is intentionally implemented as a one-layer print job. It is **not** a
+direct `UV on with this bitmap for N seconds` firmware command. A live test on
+the M7 Pro showed that the normal print-start sequence moves/prepares Z even
+when the PWSZ says zero lift. Layer thickness and lift settings only describe
+layer motion; they do not suppress initial homing. The 60-second value is only
+a starting example, not a calibrated recommendation for a particular resist,
+film stack, transparency, LCD or UV intensity.
+
+`cloud-start-pcb` uses a dedicated start profile recovered from Photon
+Workshop's own request. It sets the following editable task options to zero:
+
+```json
+{
+  "autoTop": 0,
+  "dynamicRelease": 0,
+  "failDetection": 0,
+  "offLightCompensation": 0,
+  "resinAutoLoad": 0,
+  "resinHeat": 0,
+  "stir_settings": {"stirTime": 0}
+}
+```
+
+This disables automatic feed, preprint heating, stirring, end-of-print
+auto-top, intelligent release, failure detection and off-light compensation
+for that job. The printer reports `levelling`, `platform`, `resin`, and
+`residual` as supported but `editable = 0`; omitting or falsifying those fields
+cannot be claimed to disable them. The program therefore does not provide a
+"no motion" promise for arbitrary Gerber PWSZ jobs.
+
+### Coordinate composition and polarity
+
+Gerber and DRL inputs from the same KiCad board are transformed as one group.
+Their original board coordinates are preserved, so drill hits overlay their
+pads directly; there is no independent centring or unreliable bounding-box
+matching. The combined group is centred on the LCD by default. Rotation,
+scale, mirror and XY offset are subsequently applied to the whole group.
+
+The default composition rules are:
+
+* dark Gerber primitives become UV-on LCD pixels;
+* clear Gerber polarity removes pixels inside that Gerber layer;
+* multiple Gerber files are OR-composited after each file's own dark/clear
+  operations have been evaluated;
+* `--drill-mode clear` removes Excellon hole/slot diameters, retaining visible
+  alignment/drill centres in pads;
+* `--invert` inverts only the transformed artwork rectangle, optionally
+  enlarged with `--invert-margin`; it never turns the entire unused LCD on.
+
+For negative dry-film resist, exposing the KiCad copper features is commonly
+the useful starting polarity. Positive resist commonly needs the inverse, but
+process chemistry and artwork orientation differ: always verify with a small
+coupon. `--mirror-x`/`--mirror-y` are intended for contact-side orientation;
+do not assume which one is correct without looking at text or an asymmetric
+fiducial in the exact LCD preview.
+
+The parser currently covers the constructs used by ordinary KiCad plots:
+metric/inch units, fixed coordinate formats, absolute/incremental coordinates,
+circle/rectangle/obround/polygon apertures, common aperture macros, flashes,
+linear and circular interpolation, regions, dark/clear polarity, Excellon
+tools, drill hits, routes and `G85` slots. Exotic vendor aperture macros,
+step-and-repeat and attributes that affect geometry still require a sample and
+parser verification. Parser warnings are printed; they must not be ignored for
+a production mask.
+
+### PCB CLI workflow
+
+Generate an exact viewer scene first, then create and inspect the one-layer
+PWSZ:
+
+```bash
+target/release/anycubicstudio pcb-viewer-scene \
+  board-F_Cu.gbr board.acv \
+  --drill board-PTH.drl \
+  --exposure 60 --drill-mode clear --mirror-x
+
+target/release/anycubic-viewer board.acv
+
+target/release/anycubicstudio pcb-slice \
+  board-F_Cu.gbr board-photoresist.pwsz \
+  --drill board-PTH.drl \
+  --exposure 60 --drill-mode clear --mirror-x
+
+target/release/anycubicstudio pwsz board-photoresist.pwsz
+unzip -t board-photoresist.pwsz
+```
+
+Additional layers and drill files are repeatable:
+
+```bash
+target/release/anycubicstudio pcb-slice \
+  board-F_Cu.gbr board.pwsz \
+  --gerber board-F_Mask.gbr \
+  --drill board-PTH.drl --drill board-NPTH.drl
+```
+
+The checked-in `test/pcb_demo-F_Cu.gbr` and
+`test/pcb_demo-PTH.drl` form a small deterministic fixture. For example:
+
+```bash
+target/release/anycubicstudio pcb-slice \
+  test/pcb_demo-F_Cu.gbr test/pcb_demo.pwsz \
+  --drill test/pcb_demo-PTH.drl --exposure 60
+```
+
+The path was also exercised with the supplied KiCad 10.99
+`DCDrillController-F_Cu.gbr`, `DCDrillController-PTH.drl`, and an empty but
+valid `DCDrillController-NPTH.drl`. It produced one 60 s layer with 89
+contours/19,252 vector segments and 2,172,412 UV-on pixels. The archive reader
+confirmed 13312×5120, one `layer_0.pwszImg`, three previews, zero requested
+lift and the expected 60 s exposure. This validates parsing and PWSZ structure,
+not yet the physical photoresist exposure.
+
+`pcb-default-config output.json` writes a complete editable
+`PcbExposureConfig`. `--config` is applied when encountered and following
+options override it; `--save-config` writes the final effective settings.
+
+| PCB option | Meaning and default |
+| --- | --- |
+| `--gerber FILE` | Add another Gerber file; repeatable. The first Gerber is the required positional input. |
+| `--drill FILE` | Add an Excellon drill/slot file; repeatable. |
+| `--exposure SEC` | Exposure of the only layer; default 60 s. |
+| `--drill-mode clear\|expose\|ignore` | Subtract, add, or parse without rendering drill geometry; default `clear`. |
+| `--invert` / `--no-invert` | Invert/not invert the bounded artwork rectangle; default off. |
+| `--invert-margin MM` | Expand the bounded inverse region; default 0. |
+| `--mirror-x`, `--mirror-y` | Mirror the complete Gerber+DRL group. |
+| `--rotate DEG` | Rotate the complete group around its source centre. |
+| `--scale FACTOR` | Uniform scale; default 1.0. |
+| `--move X,Y` | Offset from the LCD centre in millimetres. |
+| `--simplify MM` | Pixel-boundary contour simplification tolerance; default 0.012 mm. Increase only if a complex job exceeds the printer's segment limit. |
+| `--layer-height MM` | Synthetic single-layer thickness stored in the print profile; default 0.05 mm. |
+| `--lift-height MM` | Requested post-layer lift; default 0 mm. This does not suppress firmware homing. |
+| `--lift-speed MM_S` | Motion value stored in the generated profile; default 6 mm/s. |
+| `--build-volume X,Y,Z` | Override the machine area; resolution remains the M7 Pro profile. |
+| `--config FILE`, `--save-config FILE` | Load or save complete JSON configuration. |
+
+### PCB workflow in the GUI
+
+Use the same top `Import…` action as for STEP/STL/3MF, or drag all KiCad `.gbr`
+and `.drl` files into the main window together. The PCB tab labels Gerber and
+drill inputs separately and contains only PCB-specific parameters. Configure
+exposure, drill mode, polarity, mirroring, rotation, scale and XY offset, then
+press `Preview exact LCD layer`. In `Sliced layer`, cyan is UV-on and dark is
+masked.
+
+With only PCB files loaded, the top action reads `Slice & Upload…`. It creates
+the one-layer PWSZ, waits for successful Cloud parsing and delivers the file,
+then stops without issuing a print order. The PCB tab exposes a separate
+`Start uploaded PCB (platform removed)…` button. It uses `cloud-start-pcb` and
+shows an explicit platform-removal/homing warning. Printer status, pause,
+resume and safe active-project stop use the same Rust Cloud API as resin jobs.
+
+Before an actual exposure:
+
+1. inspect the complete layer for scale, polarity, clipped geometry, holes and
+   mirror direction;
+2. validate the PWSZ locally; `Slice & Upload…` can test transfer without
+   sending any print/start command;
+3. read printer status and require idle state;
+4. remove the build platform before starting an arbitrary Gerber PWSZ, verify
+   all remaining clearance, close the UV cover and prevent direct eye/skin
+   exposure;
+5. begin with a short calibration coupon, not a 60-second full board;
+6. keep `cloud-stop <CONFIG> <PRINTER_ID>` ready and verify idle status after
+   cancellation.
+
+The separate built-in LCD service command has no print/Z fields and uses
+firmware patterns 1, 2 or 4. It is useful for checking the screen without
+platform motion, but the recovered protocol contains no filename, PWSZ or
+bitmap field, so it cannot expose the imported Gerber artwork.
+
+Rust callers can use the same path without the CLI:
+
+```rust
+use std::path::PathBuf;
+use anycubicstudio::slicer::pcb::{PcbExposureConfig, slice_pcb};
+
+let gerbers = vec![PathBuf::from("board-F_Cu.gbr")];
+let drills = vec![PathBuf::from("board-PTH.drl")];
+let mut config = PcbExposureConfig::default();
+config.exposure_s = 60.0;
+let report = slice_pcb(&gerbers, &drills, "board.pwsz", &config)?;
+println!("{} exposed pixels", report.exposed_pixels);
+# Ok::<(), anycubicstudio::Error>(())
 ```
 
 ## Standalone PWSZ Slicer
@@ -86,7 +409,8 @@ target/release/anycubicstudio viewer model.stl --supports medium
 ```
 
 The first viewer mode renders the triangle mesh in teal and supports in blue.
-Drag with the left mouse button to rotate and use the wheel to zoom. Switch to
+Drag with the left mouse button to rotate, use Shift+left/middle/right drag to
+pan, and use the wheel to zoom. Switch to
 `Sliced layer` and move the slider to inspect the exact final contours that will
 be encoded into `layer_<n>.pwszImg`. Model and supports are sliced separately
 and their oriented contours are merged, preventing a support inside a model
@@ -131,6 +455,7 @@ The same options are accepted by `slice`, `viewer`, and `viewer-scene`. For
 | `--support-base MM` | Build-plate foot diameter. Must be at least the trunk diameter. |
 | `--support-tip-height MM` | Length of the tapered contact section. |
 | `--support-base-height MM` | Height of the build-plate foot. |
+| `--support-penetration MM` | Distance by which a generated contact enters the model surface. |
 | `--support-min-height MM` | Ignore shorter automatic supports; useful for suppressing contacts on a model already flat on the bed. |
 | `--support-max-height MM` | Reject supports longer than this value. |
 | `--support-segments N` | Radial polygon resolution for cylinder/tapered supports; square always uses four sides. |
@@ -141,9 +466,10 @@ The same options are accepted by `slice`, `viewer`, and `viewer-scene`. For
 | `--exposure SEC` | Normal-layer exposure. Default: 1.8 s. |
 | `--lift-height MM` | Lift distance. Default: 8 mm. |
 | `--lift-speed MM_S` | Lift/retract speed used in the generated profile. Default: 6 mm/s. |
+| `--build-volume X,Y,Z` | Override the machine printing zone in millimetres. |
 | `--move X,Y,Z` | Translation in millimetres, applied after centring/bed placement. |
 | `--rotate X,Y,Z` | Euler rotations in degrees. |
-| `--scale X,Y,Z` | Per-axis positive scale. |
+| `--scale X,Y,Z` | Per-axis non-zero scale. A negative component mirrors that axis and repairs winding. |
 | `--no-center` | Preserve the imported XY position instead of centring the transformed bounds. |
 | `--no-place-on-bed` | Preserve imported Z position instead of moving the lowest point to Z=0. |
 
@@ -217,6 +543,63 @@ directly. Enum strings use `snake_case`:
 
 This is only a fragment for explanation; `--config` expects the complete
 `SlicerConfig` produced by `slicer-default-config` or `--save-config`.
+
+### Multi-model project API
+
+The GUI serializes a public `SceneProject`: one global `SlicerConfig` plus an
+array of model paths, per-model transforms, and per-model support settings.
+Host programs may construct the same type directly:
+
+```rust
+use anycubicstudio::slicer::{
+    SceneModelConfig, SceneProject, SlicerConfig, SupportConfig, Transform,
+    slice_project,
+};
+
+fn main() -> anycubicstudio::Result<()> {
+    let mut left = Transform::default();
+    left.translation_mm = [-35.0, 0.0, 0.0];
+
+    let mut right = Transform::default();
+    right.translation_mm = [35.0, 0.0, 0.0];
+    right.scale = [-1.0, 1.0, 1.0]; // mirror X
+
+    let mut medium = SupportConfig::medium();
+    medium.enabled = true;
+    let mut light = SupportConfig::light();
+    light.enabled = true;
+
+    let project = SceneProject {
+        config: SlicerConfig::default(),
+        models: vec![
+            SceneModelConfig {
+                input: "left.stl".into(),
+                transform: left,
+                supports: medium,
+            },
+            SceneModelConfig {
+                input: "right.step".into(),
+                transform: right,
+                supports: light,
+            },
+        ],
+    };
+    let report = slice_project(&project, "plate.pwsz")?;
+    println!("{} layers", report.layer_count);
+    Ok(())
+}
+```
+
+The equivalent non-interactive JSON commands used by the GUI are:
+
+```bash
+target/release/anycubicstudio project-viewer-scene plate.json plate.acv
+target/release/anycubicstudio project-slice plate.json plate.pwsz
+```
+
+Models must not geometrically overlap. The slicer combines their already
+positioned triangles before layer generation; the basic GUI `Auto layout`
+action is intended to establish that invariant.
 
 The preset algorithm generates independent vertical tiered pillars. It is not
 yet Workshop's branched/tree-support engine. Always inspect contacts and sliced
@@ -343,7 +726,28 @@ firmware accepts the still-approximate volume grouping.
 
 ## Cloud Authentication
 
-The current version does not accept a username or password. It reads the OAuth `accessToken` from Photon Workshop's existing `global_config.ini` and exchanges it for a short-lived `XX-Token`:
+The program supports the same browser OAuth flow as Photon Workshop. It does
+not accept or store an account password: credentials are entered only on the
+Anycubic login page. To create or refresh a configuration:
+
+```bash
+cargo run -- cloud-login ./global_config.ini
+```
+
+The command opens the Anycubic page. After login, copy the final
+`acpws://login?...` callback address (or only its `code`) back to the terminal.
+For GUI use, select a config path and press `Log in / refresh account…`.
+
+For scripts that open the browser separately:
+
+```bash
+cargo run -- cloud-login-url
+printf '%s' '<ACPWS_CALLBACK>' | \
+  cargo run -- cloud-login-complete ./global_config.ini
+```
+
+The resulting OAuth `accessToken` is saved with Unix mode `0600` where the
+platform supports permissions. It is exchanged for a short-lived `XX-Token`:
 
 ```text
 POST /v3/public/loginWithAccessToken
@@ -355,7 +759,9 @@ Typical file location on Windows:
 %LOCALAPPDATA%\ANYCUBIC\AnycubicPhotonWorkshop_V4.1.8\global_config.ini
 ```
 
-When running from Linux with a mounted Windows partition, provide the actual path to this file. Do not copy `global_config.ini` into the repository or expose its contents in logs.
+An existing Workshop file is still accepted. When running from Linux with a
+mounted Windows partition, provide its actual path. Do not copy
+`global_config.ini` into the repository or expose its contents in logs.
 
 The embedded `WORKSHOP_APP_SECRET` is a shared Photon Workshop application key, not a user secret. It is identical across accounts for this SDK version and is not derived from the user's password. The actual secrets are the `accessToken`, `XX-Token`, refresh token, and pre-signed upload URLs.
 
@@ -426,6 +832,37 @@ cargo run -- cloud-start \
 
 A successful response contains a `msgid`, but this only indicates that the Cloud accepted the command. To confirm that printing actually started, locate the newly created project.
 
+For a one-layer PCB file, use the separate start mode only after removing the
+build platform:
+
+```bash
+cargo run -- cloud-start-pcb \
+  <PATH_TO_GLOBAL_CONFIG.INI> \
+  <PRINTER_ID> \
+  <CLOUD_FILE_ID>
+```
+
+This sends all confirmed editable M7 Pro preparation flags as zero, including
+automatic resin feeding and heating. It does not and cannot disable
+firmware-controlled homing or non-editable checks. The command also fails
+closed unless Cloud reports the target printer online and in the observed idle
+state.
+
+To light only one of the firmware's built-in diagnostic patterns without
+starting a print project or issuing a Z command:
+
+```bash
+cargo run -- cloud-exposure-start \
+  <PATH_TO_GLOBAL_CONFIG.INI> <PRINTER_ID> <1|2|4> <SECONDS>
+
+cargo run -- cloud-exposure-stop \
+  <PATH_TO_GLOBAL_CONFIG.INI> <PRINTER_ID>
+```
+
+This diagnostic command cannot display a Gerber/PWSZ layer. The start command
+is limited to 300 seconds by the client and refuses to run unless the target
+printer is observed online and idle.
+
 ### 6. Monitor the project state
 
 ```bash
@@ -477,12 +914,26 @@ After sending a control command, run `cloud-projects` again and monitor the stat
 | `slicer-default-config <JSON>`                    | Write the complete default slicer configuration | Local file creation    |
 | `viewer <MODEL> [SLICE_OPTIONS]`                  | Generate a temporary scene and inspect it        | Local GUI/read-only    |
 | `viewer-scene <MODEL> <ACV> [SLICE_OPTIONS]`      | Export the internal viewer scene without a GUI   | Local file creation    |
+| `gui [MODEL ...]`                                 | Open the multi-model plate editor and controls   | Local GUI; buttons may invoke Cloud |
+| `project-viewer-scene <JSON> <ACV>`               | Export a multi-model inspection scene            | Local file creation    |
+| `project-slice <JSON> <PWSZ>`                     | Slice a serialized multi-model plate             | Local file creation    |
+| `pcb-default-config <JSON>`                       | Write the default PCB exposure configuration      | Local file creation    |
+| `pcb-viewer-scene <GERBER> <ACV> [PCB_OPTIONS]`   | Compose Gerber/DRL and export exact LCD preview    | Local file creation    |
+| `pcb-slice <GERBER> <PWSZ> [PCB_OPTIONS]`         | Create a one-layer PCB photoresist exposure job    | Local file creation    |
+| `cloud-login <CONFIG>`                            | Browser OAuth login; save token without collecting a password | Modifies local config |
+| `cloud-login-url`                                 | Print Workshop's OAuth authorization URL          | Read-only              |
+| `cloud-login-complete <CONFIG> [CALLBACK_OR_CODE]` | Exchange OAuth callback/code and save the token   | Modifies local config  |
 | `cloud-status <CONFIG>`                           | List Cloud printers                             | Read-only              |
 | `cloud-status-detail <CONFIG>`                    | List printers and detailed status               | Read-only              |
 | `cloud-inspect <CONFIG>`                          | Show recent Cloud files and projects            | Read-only              |
+| `cloud-file-status <CONFIG> <FILE_ID>`            | Read one uploaded file's parse state            | Read-only              |
+| `cloud-slice-info <CONFIG> <GCODE_ID>`            | Read Cloud slice metadata for a parsed file      | Read-only              |
 | `cloud-projects <CONFIG>`                         | Show recent projects and their states           | Read-only              |
 | `cloud-upload <CONFIG> <PRINTER_ID> <FILE>`       | Upload and deliver a file without starting it   | Modifies Cloud storage |
 | `cloud-start <CONFIG> <PRINTER_ID> <FILE_ID>`     | Start a file, `order_id=1`                      | Active command         |
+| `cloud-start-pcb <CONFIG> <PRINTER_ID> <FILE_ID>` | Start a PCB file with confirmed editable preparation flags disabled | Active command |
+| `cloud-exposure-start <CONFIG> <PRINTER_ID> <1\|2\|4> <SECONDS>` | Run a built-in LCD pattern, `order_id=301` | Active UV command |
+| `cloud-exposure-stop <CONFIG> <PRINTER_ID>`       | Stop the built-in LCD test, `order_id=302`      | Active command         |
 | `cloud-pause <CONFIG> <PRINTER_ID>`               | Safely resolve and pause the active project     | Active command         |
 | `cloud-resume <CONFIG> <PRINTER_ID>`              | Safely resolve and resume the active project    | Active command         |
 | `cloud-stop <CONFIG> <PRINTER_ID>`                | Safely resolve and cancel the active project    | Active command         |
@@ -728,7 +1179,10 @@ src/
 
 viewer/
 ├── CMakeLists.txt
-└── main.cpp      Qt 6/OpenGL model, support, and sliced-layer viewer
+├── main.cpp         application startup
+├── main_window.*    multi-model editor, slicer and Cloud workflow
+├── print_view.*     OpenGL model/support/build-volume and layer renderer
+└── scene.*          internal `.acv` scene parser and GUI project state
 
 include/
 └── anycubic_slicer.h    public C/C++ header
@@ -738,14 +1192,26 @@ Reverse-engineering details, function addresses, and JSON packets are documented
 
 ## Known Limitations
 
-* The library does not yet perform the OAuth authorization-code flow on its own.
+* Browser OAuth authorization-code login is implemented, but secure long-term
+  token storage currently relies on the permissions of the selected INI file,
+  not an OS keychain.
 * The Cloud API is undocumented by the manufacturer and may change.
 * Cloud pause/resume codes have not been live-tested on the current M7 Pro.
 * The test M7 Pro did not respond to Workshop SSDP, so Cloud communication was used instead.
-* Generated PWSZ files have passed structural validation but not a physical printer test.
+* Generated PCB PWSZ files pass local validation and Anycubic Cloud parsing.
+  A normal hardware start was accepted, but cancelled when its initial Z
+  preparation moved the platform; the photoresist pattern itself has not yet
+  been physically validated.
+* `cloud-start-pcb` disables every editable preparation flag captured from
+  Workshop, but the M7 Pro exposes levelling/platform/resin/residue checks as
+  non-editable. No known PWSZ setting suppresses initial firmware homing.
+* The motion-free `cloud-exposure-*` path supports only firmware patterns
+  1, 2 and 4; the recovered request has no custom bitmap/PWSZ field.
 * `calc_layer_volumes.data` has a confirmed container/record layout, but its adaptive M7 grouping algorithm is approximated with four-layer groups.
 * Preview members now contain actual model/support renders at the expected 224×168, 336×252, and 800×600 dimensions. Their exact Workshop camera, lighting, and PNG compression are not byte-identical.
 * Supports are independent vertical cylinder/tapered/square pillars. Workshop-compatible tree/branched supports, island-aware optimisation, cross-bracing, and exact VoxSDK preset parity are not implemented.
+* GUI manipulation uses model selection plus numeric transform controls; an on-mesh transform gizmo, drag-to-place models, ray-picked support contacts, undo/redo, and project save/load are not implemented yet.
+* GUI `Auto layout` is rectangular shelf packing from transformed bounds, not contour-aware nesting. It does not rotate parts to optimise plate usage.
 * Hollowing, drain holes, mesh repair, and XY contour compensation are not implemented yet.
 * The built-in 3MF reader handles Core meshes, build items, components, units, and transforms. It rejects files that declare required extensions; optional material and texture data are not used for monochrome resin slicing.
 * The library does not schedule print jobs and does not replace the printer's hardware safety interlocks.

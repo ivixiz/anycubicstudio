@@ -105,10 +105,10 @@ function constructs a one-field object whose literal key is `code` and sends
 URL index `0x31`; the embedded endpoint table contains
 `/v3/public/getoauthToken`. Its response reflection lists `expires`,
 `refresh_token`, `access_token`, `scope`, `token_type`, and `id_token`
-(`QCloudSDK.c:558300` onward). The association of URL index `0x31` with that
-specific adjacent endpoint is a strong inference, not yet a captured request,
-so the Rust library does not pretend the independent browser login is
-live-validated.
+(`QCloudSDK.c:558300` onward). The Rust CLI and GUI now implement this browser
+authorization-code flow and save only the resulting access token. The endpoint
+association is code-confirmed but has not yet been documented with a redacted
+live HTTP capture, so that distinction is retained here.
 
 The strict clock requirement has two concrete causes: the Cloud signature
 contains `timestamp_ms`, and OAuth tokens also have time-based validity. It is
@@ -171,7 +171,15 @@ It is now **live-validated** on the M7 Pro:
     "filetype": 0,
     "file_key": "",
     "file_name": "",
-    "task_settings": {"ai_detect": 0, "camera_timelapse": 0},
+    "task_settings": {
+      "autoTop": 0,
+      "dynamicRelease": 0,
+      "failDetection": 1,
+      "offLightCompensation": 1,
+      "resinAutoLoad": 1,
+      "resinHeat": 1,
+      "stir_settings": {"stirTime": 0}
+    },
     "file_id": 86140277,
     "hollow_param": null,
     "is_delete_file": 0,
@@ -208,6 +216,59 @@ Workshop 4.1.8 itself constructs a small default data object in
 accepted the latter. Pause/resume ids are code-confirmed but were not sent to
 the physical machine in this test, so only start and stop are labelled
 live-validated.
+
+The full `task_settings` object above was captured in Workshop's own
+`cloud_Log.log` for `order_id=1`, not inferred from field names. The tested M7
+Pro printer metadata reports these task options as `editable=1`:
+
+```text
+autoTop, dynamicRelease, failDetection, offLightCompensation,
+resinAutoLoad, resinHeat
+```
+
+For the dedicated Rust `cloud-start-pcb` path, all six are sent as zero and
+`stir_settings.stirTime` is also zero. This suppresses the confirmed optional
+preparation/automation features, including automatic feeding and preprint
+heating. The PCB PWSZ profile additionally sets
+`slice_extpara.intelli_mode=0`.
+
+The same printer metadata marks `levelling`, `platform`, `resin`, and
+`residual` as supported with `editable=0`. They are therefore deliberately
+absent from the PCB override. A live normal start of a one-layer zero-lift job
+still caused Z/platform preparation. There is no evidence that a task setting,
+layer thickness, or zero lift can suppress firmware-controlled initial homing.
+
+### Cloud LCD service exposure
+
+Workshop has a separate service-screen route which does not start a print
+project. `FUN_1800d7780 @ 0x1800d7780` maps start/cancel to Cloud order IDs
+301/302. Its MQTT serializer is `FUN_1800e1720 @ 0x1800e1720` and the local
+topic builder is `FUN_1800d0d70 @ 0x1800d0d70`:
+
+```text
+anycubic/anycubicCloud/v1/pc/printer/{modeId}/{deviceId}/exposure
+```
+
+Start data is exactly:
+
+```json
+{"exposure_type": 1, "last_time": 5}
+```
+
+and Cloud sends it in the ordinary order envelope with `order_id=301`,
+`project_id=0`. Cancel uses `order_id=302` with
+`{"exposure_type":-1,"last_time":0}`. The equivalent LAN message is:
+
+```json
+{"type":"exposure","action":"start","data":{"exposure_type":1,"last_time":5}}
+```
+
+Only raw types 1, 2 and 4 are present in the Workshop UI. Crucially, neither
+serializer has a file, URL, pixel buffer, PWSZ, or Gerber field. It is a
+motion-free route for built-in firmware LCD patterns, not a way to show a
+caller-provided PCB mask. The Rust start path adds an online/idle preflight and
+a 300-second client-side limit; cancel intentionally remains available without
+an idle precondition.
 
 ## Transport map
 
@@ -352,6 +413,8 @@ auto-operation `total_space`, `free_space`, `resin_temp`, `signal_strength`,
 | Connection property | `properties/read` | `["connect"]` | `FUN_1800e28a0` |
 | RSSI property | `properties/read` | `["signal_strength"]` | `FUN_1800e3300` |
 | Automation state | `autoOperation/getStatus` | `null` | `FUN_1800d2ff0` |
+| Built-in LCD pattern | `exposure/start` | `{"exposure_type":1\|2\|4,"last_time":SECONDS}` | `FUN_1800e1720` |
+| Stop LCD pattern | `exposure/cancel` | scalar `0` in the direct LAN serializer | `FUN_1800e1720` and call sites |
 | Video capture | `video/startCapture`, `video/stopCapture` | `null` | `ACLanClient` call sites |
 
 `print/start` has confirmed field names:
@@ -367,7 +430,9 @@ project_type, task_settings
 **unknown**. Callers must supply them; the crate does not invent defaults.
 
 Observed but not yet exposed as high-level safety-critical commands: axis,
-resin, residual, exposure, release-film. File operations include
+resin, residual and release-film. Exposure start/cancel is now exposed only
+for the confirmed built-in raw pattern values; it does not accept arbitrary
+pixels. File operations include
 `file/deleteBatch` (`files`: `path`, `filename`), `listLocal`, `listUdisk`,
 and `listVideo`.
 
@@ -452,6 +517,10 @@ All direct-LAN tests were read-only:
   (tcpwrapped), `37` (time), `5355`, and `11311`; the recovered HTTP, MQTT,
   camera, and SSDP/TCP ports (`80`, `443`, `1883`, `8883`, `9883`, `18088`,
   `18910`, `1900`) are closed;
+- `11311/tcp` accepts a connection but returned no bytes for HTTP GET, TLS
+  ClientHello, a read-only ROS XML-RPC `getUri`, or the legacy resin-printer
+  `sysinfo` query. It must therefore remain classified as an unknown binary or
+  access-controlled service, not an assumed upload/control port;
 - no bootstrap, MQTT login, status or telemetry request was possible; no
   command, upload, movement, heating, or print action was sent.
 

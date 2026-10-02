@@ -322,6 +322,10 @@ fn prepare_layer(index: u32, z: f64, contours: Vec<Vec<Vec2>>) -> LayerSlice {
     }
 }
 
+pub(crate) fn layer_from_contours(index: u32, z: f64, contours: Vec<Vec<Vec2>>) -> LayerSlice {
+    prepare_layer(index, z, contours)
+}
+
 fn distance_squared(first: Vec2, second: Vec2) -> f64 {
     (first.x - second.x).powi(2) + (first.y - second.y).powi(2)
 }
