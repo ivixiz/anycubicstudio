@@ -48,6 +48,10 @@ pub struct PcbExposureConfig {
     pub offset_mm: [f64; 2],
     pub rotation_deg: f64,
     pub scale: f64,
+    /// Automatically mirror the complete Gerber+drill group on X when any
+    /// Gerber filename identifies a KiCad front-side production layer.
+    #[serde(default = "default_auto_mirror_front_layers")]
+    pub auto_mirror_front_layers: bool,
     pub mirror_x: bool,
     pub mirror_y: bool,
     /// Inverts pixels inside the transformed artwork bounding rectangle only,
@@ -70,6 +74,7 @@ impl Default for PcbExposureConfig {
             offset_mm: [0.0, 0.0],
             rotation_deg: 0.0,
             scale: 1.0,
+            auto_mirror_front_layers: true,
             mirror_x: false,
             mirror_y: false,
             invert: false,
@@ -78,6 +83,34 @@ impl Default for PcbExposureConfig {
             simplify_tolerance_mm: 0.012,
         }
     }
+}
+
+const FRONT_LAYER_MARKERS: [&str; 4] = ["f_cu", "f_mask", "f_paste", "f_silkscreen"];
+
+const fn default_auto_mirror_front_layers() -> bool {
+    true
+}
+
+/// Returns true for conventional KiCad front-side production filenames such
+/// as `board-F_Cu.gbr`, `board-F_Mask.gbr`, `board-F_Paste.gbr`, and
+/// `board-F_Silkscreen.gbr`. Matching is case-insensitive and treats runs of
+/// punctuation as one underscore, so `F.Cu` and `F-Cu` are accepted too.
+pub fn filename_suggests_front_mirror(path: impl AsRef<Path>) -> bool {
+    let Some(name) = path.as_ref().file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let mut normalized = String::with_capacity(name.len());
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character);
+        } else if !normalized.ends_with('_') {
+            normalized.push('_');
+        }
+    }
+    let padded = format!("_{normalized}_");
+    FRONT_LAYER_MARKERS
+        .iter()
+        .any(|marker| padded.contains(&format!("_{marker}_")))
 }
 
 #[derive(Debug, Clone)]
@@ -1766,6 +1799,8 @@ fn prepare_exposure(
     if gerber_paths.is_empty() {
         return Err(invalid("at least one Gerber file is required"));
     }
+    let automatically_mirrored =
+        config.auto_mirror_front_layers && gerber_paths.iter().any(filename_suggests_front_mirror);
     let mut gerbers = gerber_paths
         .iter()
         .map(|path| parse_gerber(path))
@@ -1801,7 +1836,7 @@ fn prepare_exposure(
         },
         radians: config.rotation_deg.to_radians(),
         scale: config.scale,
-        mirror_x: config.mirror_x,
+        mirror_x: config.mirror_x || automatically_mirrored,
         mirror_y: config.mirror_y,
     };
     for artwork in gerbers.iter_mut().chain(&mut drills) {
@@ -1921,6 +1956,12 @@ fn prepare_exposure(
         .collect::<HashSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    if automatically_mirrored && !config.mirror_x {
+        warnings.push(
+            "automatically mirrored X because a Gerber filename identifies a KiCad front-side layer"
+                .to_owned(),
+        );
+    }
     warnings.sort();
     Ok(PreparedExposure {
         grid,
@@ -2102,7 +2143,46 @@ mod tests {
         config.machine.build_volume_mm = [20.0, 10.0, 230.0];
         config.machine.pixel_size_um = [50.0, 50.0];
         config.simplify_tolerance_mm = 0.03;
+        config.auto_mirror_front_layers = false;
         config
+    }
+
+    #[test]
+    fn recognizes_only_named_front_side_production_layers() {
+        for name in [
+            "board-F_Cu.gbr",
+            "board-f_mask.gbr",
+            "board.F-Paste.gbr",
+            "F_Silkscreen.gto",
+        ] {
+            assert!(filename_suggests_front_mirror(name), "{name}");
+        }
+        for name in [
+            "board-B_Cu.gbr",
+            "board-Edge_Cuts.gbr",
+            "board-PTH.drl",
+            "my-F_Current.gbr",
+        ] {
+            assert!(!filename_suggests_front_mirror(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn front_layer_name_enables_auto_mirror_and_reports_it() {
+        let gerber = fixture(
+            "board-F_Cu.gbr",
+            "%FSLAX24Y24*%\n%MOMM*%\n%ADD10R,2.0X1.0*%\nD10*\nX020000Y010000D03*\nM02*\n",
+        );
+        let mut config = small_config();
+        config.auto_mirror_front_layers = true;
+        let prepared = prepare_exposure(std::slice::from_ref(&gerber), &[], &config).unwrap();
+        std::fs::remove_file(gerber).unwrap();
+        assert!(
+            prepared
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("automatically mirrored X"))
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@
 class QAction;
 class QByteArray;
 class QCheckBox;
+class QCloseEvent;
 class QComboBox;
 class QDoubleSpinBox;
 class QDragEnterEvent;
@@ -30,6 +31,7 @@ public:
     explicit MainWindow(const QStringList &initial_files = {}, QWidget *parent = nullptr);
 
 protected:
+    void closeEvent(QCloseEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
 
@@ -42,10 +44,13 @@ private:
     QWidget *buildPcbPanel();
     QWidget *buildCloudPanel();
     void connectActions();
+    void loadSettings();
+    void saveSettings() const;
 
     void importDialog();
     void importPaths(const QStringList &paths);
     void importPcbPaths(const QStringList &paths);
+    void updatePcbAutoMirror();
     void removeSelectedPcbFile();
     void refreshPcbFiles();
     bool previewPcb();
@@ -77,6 +82,7 @@ private:
     void updateActions();
     void browseCloudConfig();
     void loginToCloud();
+    bool connectToCloud(bool show_result);
     bool sliceProject();
     void sliceAndRun();
     bool uploadToCloud();
@@ -152,6 +158,7 @@ private:
     QDoubleSpinBox *m_pcb_exposure = nullptr;
     QComboBox *m_pcb_drill_mode = nullptr;
     QCheckBox *m_pcb_invert = nullptr;
+    QCheckBox *m_pcb_auto_mirror = nullptr;
     QCheckBox *m_pcb_mirror_x = nullptr;
     QCheckBox *m_pcb_mirror_y = nullptr;
     QDoubleSpinBox *m_pcb_rotate = nullptr;
@@ -171,6 +178,7 @@ private:
     QAction *m_status_action = nullptr;
 
     std::vector<std::unique_ptr<ModelState>> m_models;
+    SupportSettings m_default_supports;
     QStringList m_pcb_gerbers;
     QStringList m_pcb_drills;
     QVector<LayerData> m_sliced_layers;

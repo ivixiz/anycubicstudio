@@ -878,6 +878,13 @@ fn parse_pcb_arguments(
             "--move" => config.offset_mm = parse_pair(&value(&mut arguments)?)?,
             "--rotate" => config.rotation_deg = value(&mut arguments)?.parse()?,
             "--scale" => config.scale = value(&mut arguments)?.parse()?,
+            "--auto-mirror-front" => config.auto_mirror_front_layers = true,
+            "--no-auto-mirror-front" => config.auto_mirror_front_layers = false,
+            "--mirror-layers" => config.mirror_x = true,
+            "--no-mirror-layers" => {
+                config.mirror_x = false;
+                config.auto_mirror_front_layers = false;
+            }
             "--mirror-x" => config.mirror_x = true,
             "--mirror-y" => config.mirror_y = true,
             "--invert" => config.invert = true,
@@ -950,7 +957,7 @@ fn slice_usage() -> &'static str {
 
 fn pcb_usage(operation: &str) -> String {
     format!(
-        "usage: anycubicstudio {operation} <GERBER> <OUTPUT> [--gerber FILE] [--drill FILE] [--config FILE] [--save-config FILE] [--exposure SEC] [--drill-mode clear|expose|ignore] [--invert] [--mirror-x] [--mirror-y] [--rotate DEG] [--scale FACTOR] [--move X,Y] [--invert-margin MM] [--simplify MM] [--layer-height MM] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z]"
+        "usage: anycubicstudio {operation} <GERBER> <OUTPUT> [--gerber FILE] [--drill FILE] [--config FILE] [--save-config FILE] [--exposure SEC] [--drill-mode clear|expose|ignore] [--invert] [--auto-mirror-front|--no-auto-mirror-front] [--mirror-layers|--no-mirror-layers] [--mirror-x] [--mirror-y] [--rotate DEG] [--scale FACTOR] [--move X,Y] [--invert-margin MM] [--simplify MM] [--layer-height MM] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z]"
     )
 }
 

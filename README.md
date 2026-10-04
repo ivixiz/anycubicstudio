@@ -84,6 +84,21 @@ never reimplements slicing or Cloud packets in C++: it invokes the Rust
 executable directly with `QProcess`, without a command shell. The bottom
 `Rust API output` dock shows the exact operation and its result.
 
+Viewer preferences persist through Qt `QSettings`. Window layout, view mode,
+printing zone, exposure/motion values, PCB composition values, the last
+applied support defaults, account-config path, printer ID, and built-in LCD
+test values are restored on the next launch. The exact settings-file path is
+printed in `Rust API output`. Account tokens remain only in the selected
+`global_config.ini`; QSettings stores its path, never its contents. Imported
+models, PWSZ paths and Cloud file IDs are deliberately not restored, preventing
+a stale job from being started after reopening the program.
+
+When the saved account config exists, the viewer performs a read-only
+`cloud-status-detail` connection at startup and retains the detected printer
+ID. `Connect / detect printer` repeats it manually. If no config path has been
+saved, a `global_config.ini` in the working/project directory is used as a
+convenience fallback.
+
 ### Plate workflow
 
 1. Press the single `Import…` action, pass files on the command line, or drag
@@ -241,6 +256,14 @@ coupon. `--mirror-x`/`--mirror-y` are intended for contact-side orientation;
 do not assume which one is correct without looking at text or an asymmetric
 fiducial in the exact LCD preview.
 
+Direct Rust CLI use enables X mirroring automatically when any Gerber filename
+contains `F_Cu`, `F_Mask`, `F_Paste`, or `F_Silkscreen` (case-insensitive;
+punctuation variants such as `F.Cu` are accepted). The whole Gerber+DRL group
+is mirrored together, preserving drill alignment. Use
+`--no-auto-mirror-front` or `--no-mirror-layers` to override this after
+inspecting the preview. Back-side and unrelated filenames are not mirrored
+automatically.
+
 The parser currently covers the constructs used by ordinary KiCad plots:
 metric/inch units, fixed coordinate formats, absolute/incremental coordinates,
 circle/rectangle/obround/polygon apertures, common aperture macros, flashes,
@@ -259,14 +282,14 @@ PWSZ:
 target/release/anycubicstudio pcb-viewer-scene \
   board-F_Cu.gbr board.acv \
   --drill board-PTH.drl \
-  --exposure 60 --drill-mode clear --mirror-x
+  --exposure 60 --drill-mode clear
 
 target/release/anycubic-viewer board.acv
 
 target/release/anycubicstudio pcb-slice \
   board-F_Cu.gbr board-photoresist.pwsz \
   --drill board-PTH.drl \
-  --exposure 60 --drill-mode clear --mirror-x
+  --exposure 60 --drill-mode clear
 
 target/release/anycubicstudio pwsz board-photoresist.pwsz
 unzip -t board-photoresist.pwsz
@@ -311,6 +334,8 @@ options override it; `--save-config` writes the final effective settings.
 | `--invert` / `--no-invert` | Invert/not invert the bounded artwork rectangle; default off. |
 | `--invert-margin MM` | Expand the bounded inverse region; default 0. |
 | `--mirror-x`, `--mirror-y` | Mirror the complete Gerber+DRL group. |
+| `--auto-mirror-front`, `--no-auto-mirror-front` | Enable/disable filename-based front-layer X mirroring; enabled by default. |
+| `--mirror-layers`, `--no-mirror-layers` | Explicitly enable/disable transfer-side X mirroring; disabling also suppresses the filename default. |
 | `--rotate DEG` | Rotate the complete group around its source centre. |
 | `--scale FACTOR` | Uniform scale; default 1.0. |
 | `--move X,Y` | Offset from the LCD centre in millimetres. |
@@ -329,6 +354,13 @@ drill inputs separately and contains only PCB-specific parameters. Configure
 exposure, drill mode, polarity, mirroring, rotation, scale and XY offset, then
 press `Preview exact LCD layer`. In `Sliced layer`, cyan is UV-on and dark is
 masked.
+
+The `Mirror layers (X)` checkbox maps to Rust's `--mirror-layers` option.
+`Auto from KiCad F_* filename` is enabled by default and recalculates that
+checkbox whenever files are added or removed: `F_Cu`, `F_Mask`, `F_Paste`, or
+`F_Silkscreen` enables it, while a new back-only set does not inherit a stale
+front-side mirror. Disable Auto to keep a fully manual orientation. Both
+controls are saved when the viewer closes.
 
 With only PCB files loaded, the top action reads `Slice & Upload…`. It creates
 the one-layer PWSZ, waits for successful Cloud parsing and delivers the file,
@@ -355,6 +387,54 @@ The separate built-in LCD service command has no print/Z fields and uses
 firmware patterns 1, 2 or 4. It is useful for checking the screen without
 platform motion, but the recovered protocol contains no filename, PWSZ or
 bitmap field, so it cannot expose the imported Gerber artwork.
+
+### Why RERF is not a no-motion custom LCD path
+
+Photon Workshop's `Calibration Exposure`/RERF mode was checked separately
+because firmware 4.0.8.6 advertises expanded 4/6/8-partition calibration.
+The recovered implementation confirms that it is a specialised **sliced print
+job**, not a service-screen bitmap upload:
+
+* `FUN_1802cd2c0 @ 0x1802cd2c0` stores the partition count and
+  `FUN_1802cdb30 @ 0x1802cdb30` stores the per-partition exposure-time array;
+* `FUN_1802c96b0 @ 0x1802c96b0` prepares the RERF models and invokes
+  `runSliceTask`;
+* `FUN_1802cce60 @ 0x1802cce60` and
+  `FUN_1802cd050 @ 0x1802cd050` invoke `saveSlicedFile` and
+  `saveSlicedFileToTempFile` respectively;
+* `lcd_func::Func_Rerf::ToJsonString @ 0x18002460e` serialises
+  `rerf_function` metadata containing `enable`, `model_type`, `model_name`,
+  `partition_num`, and `partition_exposure_array` into the sliced-file path.
+
+This agrees with Anycubic's
+[4.0.8.6 firmware notes](https://wiki.anycubic.com/en/resin-3d-printer/photon-mono-m7-pro/firmware-update-log):
+the feature changes calibration partitions and their exposure times. It does
+not document or expose a command that accepts arbitrary LCD pixels.
+
+Consequently the recovered stock Workshop/Cloud/LAN API currently offers only
+two choices: a normal PWSZ print that may perform mandatory initial Z
+preparation, or a motion-free service exposure using one of the firmware's
+built-in patterns. The project deliberately has no `custom-exposure` command:
+implementing one from guessed fields or probing unknown `exposure_type` values
+would be both unsupported and unsafe.
+
+This does not prove that custom motion-free display is impossible inside the
+printer. Resolving it requires the M7 Pro's **system/application firmware** (an
+update package containing the root filesystem and printer daemons, or a
+read-only dump), followed by analysis of the handler for exposure order 301
+and the LCD/framebuffer or layer-decoder process. The separately published
+`FPGA_1422_0047(0821).bin` bitstream is not that system firmware. Back up the
+original storage before any firmware modification; no firmware image was
+flashed during this work.
+
+As a second check, Anycubic's official M7 Pro `R_E_R_F.pwsz` was inspected
+without uploading it. It contains 288 ordinary layer images and requests an
+8 mm Z lift on every layer; it is therefore particularly unsuitable as a
+no-motion PCB exposure shortcut. The Cloud SDK does expose a possible route
+to the missing system image: `FUN_1801f55a0 @ 0x1801f55a0` parses an OTA
+`firmware_url`. The current 4.0.8.6 printer reports `need_update = 0`, however,
+so the server response does not include that URL. A future OTA response, an
+existing update cache, or a read-only eMMC/rootfs dump is needed to continue.
 
 Rust callers can use the same path without the CLI:
 

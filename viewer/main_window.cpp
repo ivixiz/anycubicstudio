@@ -5,6 +5,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDir>
@@ -34,12 +35,15 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
+#include <QSet>
+#include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QTabWidget>
 #include <QTemporaryFile>
+#include <QTimer>
 #include <QToolBar>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -123,6 +127,26 @@ QString quoted(const QString &value) {
     return '"' + escaped + '"';
 }
 
+bool filenameSuggestsFrontMirror(const QString &path) {
+    QString normalized;
+    const QString name = QFileInfo(path).fileName().toLower();
+    normalized.reserve(name.size());
+    for (const QChar character : name) {
+        if (character.isLetterOrNumber())
+            normalized.append(character);
+        else if (!normalized.endsWith('_'))
+            normalized.append('_');
+    }
+    const QString padded = QStringLiteral("_") + normalized + QStringLiteral("_");
+    for (const QString &marker : {QStringLiteral("f_cu"), QStringLiteral("f_mask"),
+                                  QStringLiteral("f_paste"),
+                                  QStringLiteral("f_silkscreen")}) {
+        if (padded.contains(QStringLiteral("_") + marker + QStringLiteral("_")))
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 MainWindow::MainWindow(const QStringList &initial_files, QWidget *parent) : QMainWindow(parent) {
@@ -131,14 +155,19 @@ MainWindow::MainWindow(const QStringList &initial_files, QWidget *parent) : QMai
     setAcceptDrops(true);
     buildInterface();
     connectActions();
+    loadSettings();
     printingZoneChanged();
     if (!initial_files.isEmpty())
         importPaths(initial_files);
     updateActions();
+    if (QFileInfo(m_cloud_config->text()).isFile()) {
+        QTimer::singleShot(0, this, [this] { connectToCloud(false); });
+    }
 }
 
 void MainWindow::buildInterface() {
     auto *toolbar = addToolBar("Workflow");
+    toolbar->setObjectName("workflowToolbar");
     toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     toolbar->setMovable(false);
     QAction *import_action = toolbar->addAction("Import…");
@@ -191,6 +220,7 @@ void MainWindow::buildInterface() {
     setCentralWidget(splitter);
 
     auto *dock = new QDockWidget("Rust API output", this);
+    dock->setObjectName("rustApiOutputDock");
     m_log = new QPlainTextEdit;
     m_log->setReadOnly(true);
     m_log->setMaximumBlockCount(2000);
@@ -440,8 +470,13 @@ QWidget *MainWindow::buildPcbPanel() {
     m_pcb_drill_mode = new QComboBox;
     m_pcb_drill_mode->addItems({"clear", "expose", "ignore"});
     m_pcb_invert = new QCheckBox("Invert inside artwork bounds");
-    m_pcb_mirror_x = new QCheckBox("X");
-    m_pcb_mirror_y = new QCheckBox("Y");
+    m_pcb_auto_mirror = new QCheckBox("Auto from KiCad F_* filename");
+    m_pcb_auto_mirror->setChecked(true);
+    m_pcb_mirror_x = new QCheckBox("Mirror layers (X)");
+    m_pcb_mirror_x->setToolTip(
+        "Passed to the Rust CLI as --mirror-layers. Automatically enabled for F_Cu, F_Mask, "
+        "F_Paste and F_Silkscreen filenames; it can still be changed manually.");
+    m_pcb_mirror_y = new QCheckBox("Mirror Y (advanced)");
     m_pcb_rotate = spin(-360.0, 360.0, 0.0, 2, 5.0);
     m_pcb_scale = spin(0.001, 1000.0, 1.0, 5, 0.01);
     m_pcb_move[0] = spin(-1000.0, 1000.0, 0.0);
@@ -452,7 +487,8 @@ QWidget *MainWindow::buildPcbPanel() {
     form->addRow("Exposure (s)", m_pcb_exposure);
     form->addRow("Drill pixels", m_pcb_drill_mode);
     form->addRow("Polarity", m_pcb_invert);
-    form->addRow("Mirror", rowOf({m_pcb_mirror_x, m_pcb_mirror_y}));
+    form->addRow("Mirror detection", m_pcb_auto_mirror);
+    form->addRow("Transfer orientation", rowOf({m_pcb_mirror_x, m_pcb_mirror_y}));
     form->addRow("Rotate (°)", m_pcb_rotate);
     form->addRow("Scale", m_pcb_scale);
     form->addRow("Move X/Y (mm)", rowOf({m_pcb_move[0], m_pcb_move[1]}));
@@ -471,8 +507,9 @@ QWidget *MainWindow::buildPcbPanel() {
     auto *warning = new QLabel(
         "The result is a normal one-layer printer job, not a raw UV-lamp command. Even with "
         "zero configured lift, printer firmware may home or move the platform at print start. "
-        "Slice & Upload will not start it automatically. Preview polarity and mirror direction; "
-        "remove the platform before using the explicit PCB start button.");
+        "Front-side KiCad layer names enable Mirror layers automatically. Slice & Upload will "
+        "not start the printer. Preview polarity and orientation, then remove the platform "
+        "before using the explicit PCB start button.");
     warning->setWordWrap(true);
     warning->setStyleSheet("color: #d27b68;");
     layout->addWidget(warning);
@@ -496,6 +533,10 @@ QWidget *MainWindow::buildPcbPanel() {
         connect(value, &QDoubleSpinBox::valueChanged, this, [this] { invalidateSlice(); });
     connect(m_pcb_drill_mode, &QComboBox::currentIndexChanged, this,
             [this] { invalidateSlice(); });
+    connect(m_pcb_auto_mirror, &QCheckBox::toggled, this, [this] {
+        updatePcbAutoMirror();
+        invalidateSlice();
+    });
     for (QCheckBox *value : {m_pcb_invert, m_pcb_mirror_x, m_pcb_mirror_y})
         connect(value, &QCheckBox::toggled, this, [this] { invalidateSlice(); });
     return content;
@@ -514,6 +555,8 @@ QWidget *MainWindow::buildCloudPanel() {
     form->addRow("Account config", rowOf({m_cloud_config, browse}));
     auto *login = new QPushButton("Log in to Anycubic…");
     form->addRow("OAuth account", login);
+    auto *connect_cloud = new QPushButton("Connect / detect printer");
+    form->addRow("Cloud connection", connect_cloud);
     m_printer_id = new QLineEdit;
     m_printer_id->setPlaceholderText("Numeric cloud printer ID");
     form->addRow("Printer ID", m_printer_id);
@@ -522,9 +565,9 @@ QWidget *MainWindow::buildCloudPanel() {
     m_cloud_file_label->setWordWrap(true);
     layout->addWidget(m_cloud_file_label);
     auto *status = new QLabel(
-        "Workflow: Import → Slice & Run. One action selects the 3D or PCB slicer, writes PWSZ, "
-        "uploads it and asks for a final real-hardware confirmation before start. Pause, Resume "
-        "and Stop resolve the active project automatically, so a project ID is not required.");
+        "Workflow: Import → Slice. A 3D job can continue to the guarded print start. A PCB job "
+        "stops after upload and must be started with its separate platform-removed button. "
+        "Account path, printer ID and viewer settings persist across restarts.");
     status->setWordWrap(true);
     layout->addWidget(status);
     auto *warning = new QLabel(
@@ -559,6 +602,8 @@ QWidget *MainWindow::buildCloudPanel() {
     layout->addStretch();
     connect(browse, &QPushButton::clicked, this, [this] { browseCloudConfig(); });
     connect(login, &QPushButton::clicked, this, [this] { loginToCloud(); });
+    connect(connect_cloud, &QPushButton::clicked, this,
+            [this] { connectToCloud(true); });
     connect(start_exposure, &QPushButton::clicked, this,
             [this] { startBuiltinExposure(); });
     connect(stop_exposure, &QPushButton::clicked, this, [this] { stopBuiltinExposure(); });
@@ -568,6 +613,140 @@ QWidget *MainWindow::buildCloudPanel() {
 void MainWindow::connectActions() {
     connect(m_model_list, &QListWidget::currentRowChanged, this,
             [this](int row) { selectModel(row); });
+}
+
+void MainWindow::loadSettings() {
+    QSettings settings;
+    const QByteArray geometry = settings.value("window/geometry").toByteArray();
+    const QByteArray state = settings.value("window/state").toByteArray();
+    if (!geometry.isEmpty())
+        restoreGeometry(geometry);
+    if (!state.isEmpty())
+        restoreState(state);
+
+    m_view_mode->setCurrentIndex(settings.value("view/mode", 0).toInt());
+    m_show_model->setChecked(settings.value("view/showModel", true).toBool());
+    m_show_supports->setChecked(settings.value("view/showSupports", true).toBool());
+
+    m_zone[0]->setValue(settings.value("print/zoneX", M7_BUILD_X).toDouble());
+    m_zone[1]->setValue(settings.value("print/zoneY", M7_BUILD_Y).toDouble());
+    m_zone[2]->setValue(settings.value("print/zoneZ", M7_BUILD_Z).toDouble());
+    m_layer_height->setValue(settings.value("print/layerHeight", 0.05).toDouble());
+    m_bottom_layers->setValue(settings.value("print/bottomLayers", 5).toInt());
+    m_bottom_exposure->setValue(settings.value("print/bottomExposure", 28.0).toDouble());
+    m_exposure->setValue(settings.value("print/exposure", 1.8).toDouble());
+    m_lift_height->setValue(settings.value("print/liftHeight", 8.0).toDouble());
+    m_lift_speed->setValue(settings.value("print/liftSpeed", 6.0).toDouble());
+    m_off_time->setValue(settings.value("print/offTime", 0.5).toDouble());
+
+    m_pcb_exposure->setValue(settings.value("pcb/exposure", 60.0).toDouble());
+    m_pcb_drill_mode->setCurrentText(settings.value("pcb/drillMode", "clear").toString());
+    m_pcb_invert->setChecked(settings.value("pcb/invert", false).toBool());
+    m_pcb_auto_mirror->setChecked(settings.value("pcb/autoMirror", true).toBool());
+    m_pcb_mirror_x->setChecked(settings.value("pcb/mirrorLayers", false).toBool());
+    m_pcb_mirror_y->setChecked(settings.value("pcb/mirrorY", false).toBool());
+    m_pcb_rotate->setValue(settings.value("pcb/rotate", 0.0).toDouble());
+    m_pcb_scale->setValue(settings.value("pcb/scale", 1.0).toDouble());
+    m_pcb_move[0]->setValue(settings.value("pcb/moveX", 0.0).toDouble());
+    m_pcb_move[1]->setValue(settings.value("pcb/moveY", 0.0).toDouble());
+    m_pcb_invert_margin->setValue(settings.value("pcb/invertMargin", 0.0).toDouble());
+    m_pcb_simplify->setValue(settings.value("pcb/simplify", 0.012).toDouble());
+    m_pcb_lift_height->setValue(settings.value("pcb/liftHeight", 0.0).toDouble());
+
+    m_default_supports.enabled = settings.value("supports/enabled", false).toBool();
+    m_default_supports.automatic = settings.value("supports/automatic", true).toBool();
+    m_default_supports.shape = settings.value("supports/shape", "tapered").toString();
+    m_default_supports.angle = settings.value("supports/angle", 45.0).toDouble();
+    m_default_supports.spacing = settings.value("supports/spacing", 4.0).toDouble();
+    m_default_supports.tip = settings.value("supports/tip", 0.5).toDouble();
+    m_default_supports.trunk = settings.value("supports/trunk", 1.2).toDouble();
+    m_default_supports.base = settings.value("supports/base", 4.5).toDouble();
+    m_default_supports.tip_height = settings.value("supports/tipHeight", 1.5).toDouble();
+    m_default_supports.base_height = settings.value("supports/baseHeight", 0.8).toDouble();
+    m_default_supports.penetration = settings.value("supports/penetration", 0.15).toDouble();
+    m_default_supports.minimum_height = settings.value("supports/minHeight", 2.0).toDouble();
+    m_default_supports.maximum_height = settings.value("supports/maxHeight", 180.0).toDouble();
+    m_default_supports.segments = settings.value("supports/segments", 12).toInt();
+
+    const QString configured_path = settings.value("cloud/configPath").toString();
+    if (m_cloud_config->text().isEmpty() && !configured_path.isEmpty())
+        m_cloud_config->setText(configured_path);
+    if (m_cloud_config->text().isEmpty()) {
+        const QStringList candidates{
+            QDir::current().filePath("global_config.ini"),
+            QDir(QCoreApplication::applicationDirPath()).absoluteFilePath("../../global_config.ini")};
+        for (const QString &candidate : candidates) {
+            if (QFileInfo(candidate).isFile()) {
+                m_cloud_config->setText(QFileInfo(candidate).absoluteFilePath());
+                break;
+            }
+        }
+    }
+    m_printer_id->setText(settings.value("cloud/printerId").toString());
+    m_exposure_pattern->setCurrentIndex(settings.value("cloud/exposurePattern", 0).toInt());
+    m_exposure_duration->setValue(settings.value("cloud/exposureDuration", 5).toInt());
+    appendLog("Restored viewer preferences from " + settings.fileName() +
+              ". Print files and Cloud file IDs are intentionally not restored.");
+}
+
+void MainWindow::saveSettings() const {
+    QSettings settings;
+    settings.setValue("window/geometry", saveGeometry());
+    settings.setValue("window/state", saveState());
+    settings.setValue("view/mode", m_view_mode->currentIndex());
+    settings.setValue("view/showModel", m_show_model->isChecked());
+    settings.setValue("view/showSupports", m_show_supports->isChecked());
+
+    settings.setValue("print/zoneX", m_zone[0]->value());
+    settings.setValue("print/zoneY", m_zone[1]->value());
+    settings.setValue("print/zoneZ", m_zone[2]->value());
+    settings.setValue("print/layerHeight", m_layer_height->value());
+    settings.setValue("print/bottomLayers", m_bottom_layers->value());
+    settings.setValue("print/bottomExposure", m_bottom_exposure->value());
+    settings.setValue("print/exposure", m_exposure->value());
+    settings.setValue("print/liftHeight", m_lift_height->value());
+    settings.setValue("print/liftSpeed", m_lift_speed->value());
+    settings.setValue("print/offTime", m_off_time->value());
+
+    settings.setValue("pcb/exposure", m_pcb_exposure->value());
+    settings.setValue("pcb/drillMode", m_pcb_drill_mode->currentText());
+    settings.setValue("pcb/invert", m_pcb_invert->isChecked());
+    settings.setValue("pcb/autoMirror", m_pcb_auto_mirror->isChecked());
+    settings.setValue("pcb/mirrorLayers", m_pcb_mirror_x->isChecked());
+    settings.setValue("pcb/mirrorY", m_pcb_mirror_y->isChecked());
+    settings.setValue("pcb/rotate", m_pcb_rotate->value());
+    settings.setValue("pcb/scale", m_pcb_scale->value());
+    settings.setValue("pcb/moveX", m_pcb_move[0]->value());
+    settings.setValue("pcb/moveY", m_pcb_move[1]->value());
+    settings.setValue("pcb/invertMargin", m_pcb_invert_margin->value());
+    settings.setValue("pcb/simplify", m_pcb_simplify->value());
+    settings.setValue("pcb/liftHeight", m_pcb_lift_height->value());
+
+    settings.setValue("supports/enabled", m_default_supports.enabled);
+    settings.setValue("supports/automatic", m_default_supports.automatic);
+    settings.setValue("supports/shape", m_default_supports.shape);
+    settings.setValue("supports/angle", m_default_supports.angle);
+    settings.setValue("supports/spacing", m_default_supports.spacing);
+    settings.setValue("supports/tip", m_default_supports.tip);
+    settings.setValue("supports/trunk", m_default_supports.trunk);
+    settings.setValue("supports/base", m_default_supports.base);
+    settings.setValue("supports/tipHeight", m_default_supports.tip_height);
+    settings.setValue("supports/baseHeight", m_default_supports.base_height);
+    settings.setValue("supports/penetration", m_default_supports.penetration);
+    settings.setValue("supports/minHeight", m_default_supports.minimum_height);
+    settings.setValue("supports/maxHeight", m_default_supports.maximum_height);
+    settings.setValue("supports/segments", m_default_supports.segments);
+
+    settings.setValue("cloud/configPath", m_cloud_config->text().trimmed());
+    settings.setValue("cloud/printerId", m_printer_id->text().trimmed());
+    settings.setValue("cloud/exposurePattern", m_exposure_pattern->currentIndex());
+    settings.setValue("cloud/exposureDuration", m_exposure_duration->value());
+    settings.sync();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event) {
+    saveSettings();
+    QMainWindow::closeEvent(event);
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent *event) {
@@ -630,6 +809,20 @@ void MainWindow::importPaths(const QStringList &paths) {
     }
 }
 
+void MainWindow::updatePcbAutoMirror() {
+    if (!m_pcb_auto_mirror || !m_pcb_auto_mirror->isChecked())
+        return;
+    const bool front_layer = std::any_of(m_pcb_gerbers.cbegin(), m_pcb_gerbers.cend(),
+                                         filenameSuggestsFrontMirror);
+    const bool changed = m_pcb_mirror_x->isChecked() != front_layer;
+    m_pcb_mirror_x->setChecked(front_layer);
+    if (changed) {
+        appendLog(front_layer
+                      ? "Enabled Mirror layers (X): a front-side KiCad filename was detected."
+                      : "Disabled Mirror layers (X): the current set has no named front layer.");
+    }
+}
+
 void MainWindow::importPcbPaths(const QStringList &paths) {
     int imported = 0;
     for (const QString &source : paths) {
@@ -656,6 +849,7 @@ void MainWindow::importPcbPaths(const QStringList &paths) {
     }
     if (imported == 0)
         return;
+    updatePcbAutoMirror();
     refreshPcbFiles();
     invalidateSlice();
     m_pcb_status->setText(
@@ -676,6 +870,7 @@ void MainWindow::removeSelectedPcbFile() {
         if (drill >= 0 && drill < m_pcb_drills.size())
             m_pcb_drills.removeAt(drill);
     }
+    updatePcbAutoMirror();
     refreshPcbFiles();
     invalidateSlice();
     if (m_pcb_gerbers.isEmpty())
@@ -715,6 +910,7 @@ bool MainWindow::importPath(const QString &source) {
             QMessageBox::warning(this, "Import", "Unsupported model format:\n" + path);
             return false;
         }
+        model->supports = m_default_supports;
         if (!rebuildModel(*model))
             return false;
     }
@@ -938,6 +1134,8 @@ void MainWindow::applySupports() {
         loadModelControls();
         return;
     }
+    m_default_supports = support;
+    m_default_supports.manual.clear();
     m_support_preset->setCurrentIndex(0);
     refreshView();
     invalidateSlice();
@@ -1131,8 +1329,64 @@ void MainWindow::browseCloudConfig() {
     const QString path = QFileDialog::getOpenFileName(
         this, "Select Photon Workshop account config", m_cloud_config->text(),
         "Configuration (global_config.ini *.ini);;All files (*)");
-    if (!path.isEmpty())
+    if (!path.isEmpty()) {
         m_cloud_config->setText(path);
+        saveSettings();
+    }
+}
+
+bool MainWindow::connectToCloud(bool show_result) {
+    const QFileInfo config(m_cloud_config->text().trimmed());
+    if (!config.isFile()) {
+        const QString message = "Select an existing global_config.ini first.";
+        appendLog("Cloud connection skipped: " + message);
+        if (show_result)
+            QMessageBox::warning(this, "Cloud connection", message);
+        return false;
+    }
+    const ProcessResult status =
+        runRust({"cloud-status-detail", config.absoluteFilePath()}, "Connecting to printer");
+    if (!status.ok) {
+        if (show_result)
+            QMessageBox::critical(this, "Cloud connection", status.output);
+        return false;
+    }
+
+    QSet<QString> printer_ids;
+    const QRegularExpression id_pattern("id=Some\\(\\\"(\\d+)\\\"\\)");
+    QRegularExpressionMatchIterator matches = id_pattern.globalMatch(status.output);
+    while (matches.hasNext())
+        printer_ids.insert(matches.next().captured(1));
+    QString selected = m_printer_id->text().trimmed();
+    if (!printer_ids.contains(selected)) {
+        if (printer_ids.size() == 1)
+            selected = *printer_ids.constBegin();
+        else {
+            const QString message =
+                printer_ids.isEmpty()
+                    ? "Cloud returned no printer ID."
+                    : "Cloud returned multiple printers; enter the desired printer ID.";
+            appendLog("Cloud connection incomplete: " + message);
+            if (show_result)
+                QMessageBox::warning(this, "Cloud connection", message + "\n\n" + status.output);
+            return false;
+        }
+    }
+    m_cloud_config->setText(config.absoluteFilePath());
+    m_printer_id->setText(selected);
+    saveSettings();
+    const bool online = status.output.contains("device_status=Some(1)");
+    const bool idle = status.output.contains("is_printing=Some(1)");
+    appendLog(QString("Connected to Cloud printer %1: online=%2, idle=%3. Settings saved.")
+                  .arg(selected, online ? "yes" : "no", idle ? "yes" : "no"));
+    if (show_result) {
+        QMessageBox::information(
+            this, "Cloud connection",
+            QString("Connected to printer %1.\nOnline: %2\nIdle: %3\n\nThe account path and "
+                    "printer ID will be restored next time.")
+                .arg(selected, online ? "yes" : "no", idle ? "yes" : "no"));
+    }
+    return true;
 }
 
 void MainWindow::loginToCloud() {
@@ -1179,21 +1433,14 @@ void MainWindow::loginToCloud() {
         return;
     }
 
-    const ProcessResult status = runRust(
-        {"cloud-status", QFileInfo(config_path).absoluteFilePath()},
-        "Reading printers for this account");
-    if (status.ok) {
-        const QRegularExpression id_pattern("id=Some\\(\\\"(\\d+)\\\"\\)");
-        const QRegularExpressionMatch match = id_pattern.match(status.output);
-        if (match.hasMatch())
-            m_printer_id->setText(match.captured(1));
-    }
+    m_cloud_config->setText(QFileInfo(config_path).absoluteFilePath());
+    const bool connected = connectToCloud(false);
+    saveSettings();
     QMessageBox::information(
         this, "Anycubic login",
-        status.ok ? "Login completed and the account printer list was loaded."
-                  : "Login completed. The token was saved, but reading the printer list "
-                    "failed:\n\n" +
-                        status.output);
+        connected ? "Login completed and the account printer was connected. Settings saved."
+                  : "Login completed and the token was saved, but automatic printer detection "
+                    "failed. Use Connect / detect printer to retry.");
 }
 
 void MainWindow::sliceAndRun() {
@@ -1693,10 +1940,13 @@ QStringList MainWindow::pcbArguments(const QString &operation, const QString &ou
         result << "--gerber" << m_pcb_gerbers[index];
     for (const QString &drill : m_pcb_drills)
         result << "--drill" << drill;
+    // The GUI already displays and persists the effective choice. Disable the
+    // CLI's filename default so manually clearing the checkbox is respected.
+    result << "--no-auto-mirror-front";
     if (m_pcb_invert->isChecked())
         result << "--invert";
     if (m_pcb_mirror_x->isChecked())
-        result << "--mirror-x";
+        result << "--mirror-layers";
     if (m_pcb_mirror_y->isChecked())
         result << "--mirror-y";
     return result;
