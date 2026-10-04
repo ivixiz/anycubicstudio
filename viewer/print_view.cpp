@@ -5,6 +5,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QtMath>
 #include <QVector4D>
 #include <QWheelEvent>
 
@@ -77,12 +78,22 @@ void PrintView::setGizmoMode(GizmoMode mode) {
     update();
 }
 
+void PrintView::setRotationZOnly(bool enabled) { m_rotation_z_only = enabled; }
+
+void PrintView::setMinimumSelectedScale(float scale) {
+    m_minimum_selected_scale = std::max(1, int(std::lround(scale)));
+}
+
 void PrintView::setSelectionHandler(SelectionHandler handler) {
     m_selection_handler = std::move(handler);
 }
 
 void PrintView::setTransformHandler(TransformHandler handler) {
     m_transform_handler = std::move(handler);
+}
+
+void PrintView::setTransformFinishedHandler(TransformFinishedHandler handler) {
+    m_transform_finished_handler = std::move(handler);
 }
 
 void PrintView::appendLineVertex(QVector<float> &target, const QVector3D &point) {
@@ -184,7 +195,7 @@ void PrintView::setObjects(const std::vector<std::unique_ptr<SceneObject>> &obje
 
 void PrintView::resetCamera() {
     m_yaw = -35.0f;
-    m_pitch = 58.0f;
+    m_pitch = 32.0f;
     m_zoom = 1.0f;
     m_pan = QVector2D();
     fitLayer();
@@ -253,16 +264,63 @@ QMatrix4x4 PrintView::currentMvp() const {
     QMatrix4x4 projection;
     projection.perspective(35.0f, float(width()) / std::max(1, height()),
                            std::max(0.01f, radius * 0.005f), radius * 30.0f);
+    const float yaw = qDegreesToRadians(m_yaw);
+    const float pitch = qDegreesToRadians(m_pitch);
+    const QVector3D eye_direction(std::sin(yaw) * std::cos(pitch),
+                                  -std::cos(yaw) * std::cos(pitch), std::sin(pitch));
+    const QVector3D forward = -eye_direction;
+    const QVector3D right(std::cos(yaw), std::sin(yaw), 0.0f);
+    const QVector3D up = QVector3D::crossProduct(right, forward).normalized();
+    const QVector3D target = centre - right * m_pan.x() - up * m_pan.y();
+    const float distance = radius * 3.5f / m_zoom;
     QMatrix4x4 view;
-    view.lookAt(QVector3D(0.0f, -radius * 3.0f / m_zoom, radius * 1.8f / m_zoom),
-                QVector3D(), QVector3D(0.0f, 0.0f, 1.0f));
-    QMatrix4x4 world;
-    world.rotate(m_pitch - 58.0f, 1.0f, 0.0f, 0.0f);
-    world.rotate(m_yaw + 35.0f, 0.0f, 0.0f, 1.0f);
-    world.translate(-centre);
-    QMatrix4x4 screen_pan;
-    screen_pan.translate(m_pan.x(), m_pan.y(), 0.0f);
-    return projection * screen_pan * view * world;
+    view.lookAt(target + eye_direction * distance, target, up);
+    return projection * view;
+}
+
+QVector3D PrintView::cameraForward() const {
+    const float yaw = qDegreesToRadians(m_yaw);
+    const float pitch = qDegreesToRadians(m_pitch);
+    return QVector3D(-std::sin(yaw) * std::cos(pitch),
+                     std::cos(yaw) * std::cos(pitch), -std::sin(pitch));
+}
+
+float PrintView::worldUnitsPerPixel() const {
+    const float plate_radius = std::max(m_build_volume.x(), m_build_volume.y()) * 0.58f;
+    const float model_radius = std::max(1.0f, (m_maximum - m_minimum).length() * 0.55f);
+    const float distance = std::max(plate_radius, model_radius) * 3.5f / m_zoom;
+    return 2.0f * distance * std::tan(qDegreesToRadians(35.0f) * 0.5f) /
+           std::max(1, height());
+}
+
+QPointF PrintView::projectPoint(const QVector3D &point, const QMatrix4x4 &mvp) const {
+    const QVector4D clip = mvp * QVector4D(point, 1.0f);
+    if (std::abs(clip.w()) < 1.0e-7f)
+        return QPointF(width() * 0.5, height() * 0.5);
+    const QVector3D ndc = clip.toVector3DAffine();
+    return QPointF((ndc.x() * 0.5f + 0.5f) * width(),
+                   (0.5f - ndc.y() * 0.5f) * height());
+}
+
+bool PrintView::unprojectToDragPlane(const QPointF &position, QVector3D &point) const {
+    const float x = float(position.x() * 2.0 / std::max(1, width()) - 1.0);
+    const float y = float(1.0 - position.y() * 2.0 / std::max(1, height()));
+    QVector4D near_point = m_drag_inverse_mvp * QVector4D(x, y, -1.0f, 1.0f);
+    QVector4D far_point = m_drag_inverse_mvp * QVector4D(x, y, 1.0f, 1.0f);
+    if (std::abs(near_point.w()) < 1.0e-7f || std::abs(far_point.w()) < 1.0e-7f)
+        return false;
+    near_point /= near_point.w();
+    far_point /= far_point.w();
+    const QVector3D origin = near_point.toVector3D();
+    const QVector3D direction = (far_point - near_point).toVector3D().normalized();
+    const float denominator = QVector3D::dotProduct(direction, m_drag_plane_normal);
+    if (std::abs(denominator) < 1.0e-6f)
+        return false;
+    const float distance = QVector3D::dotProduct(m_drag_plane_point - origin,
+                                                  m_drag_plane_normal) /
+                           denominator;
+    point = origin + direction * distance;
+    return std::isfinite(point.x()) && std::isfinite(point.y()) && std::isfinite(point.z());
 }
 
 void PrintView::paintGL() {
@@ -388,6 +446,44 @@ void PrintView::mousePressEvent(QMouseEvent *event) {
         m_selection_handler(m_pressed_object, event->modifiers());
     m_dragging_object = m_pressed_object >= 0 && event->button() == Qt::LeftButton &&
                         !(event->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier));
+    if (!m_dragging_object)
+        return;
+    bool invertible = false;
+    const QMatrix4x4 mvp = currentMvp();
+    m_drag_inverse_mvp = mvp.inverted(&invertible);
+    if (!invertible) {
+        m_dragging_object = false;
+        return;
+    }
+    m_drag_plane_point = m_gizmo_center;
+    m_drag_plane_normal = m_gizmo_mode == GizmoMode::Move
+                              ? QVector3D(0.0f, 0.0f, 1.0f)
+                              : cameraForward().normalized();
+    m_drag_unproject_valid = unprojectToDragPlane(event->position(), m_drag_start_world);
+    if (m_gizmo_mode != GizmoMode::Move)
+        m_drag_unproject_valid = true;
+    m_drag_emitted_move = QVector3D();
+    m_gizmo_screen_center = projectPoint(m_gizmo_center, mvp);
+    const QPointF radial(event->position().x() - m_gizmo_screen_center.x(),
+                         m_gizmo_screen_center.y() - event->position().y());
+    m_drag_last_angle = std::atan2(float(radial.y()), float(radial.x()));
+    m_drag_angle_total = 0.0f;
+    m_drag_emitted_angle = 0.0f;
+    m_drag_start_radius = float(std::hypot(radial.x(), radial.y()));
+    m_drag_emitted_scale_steps = 0;
+    if (m_rotation_z_only) {
+        m_drag_rotation_axis = QVector3D(0.0f, 0.0f, 1.0f);
+    } else {
+        const QVector3D toward_camera = -m_drag_plane_normal;
+        const QVector3D absolute(std::abs(toward_camera.x()), std::abs(toward_camera.y()),
+                                 std::abs(toward_camera.z()));
+        if (absolute.x() >= absolute.y() && absolute.x() >= absolute.z())
+            m_drag_rotation_axis = QVector3D(std::copysign(1.0f, toward_camera.x()), 0, 0);
+        else if (absolute.y() >= absolute.z())
+            m_drag_rotation_axis = QVector3D(0, std::copysign(1.0f, toward_camera.y()), 0);
+        else
+            m_drag_rotation_axis = QVector3D(0, 0, std::copysign(1.0f, toward_camera.z()));
+    }
 }
 
 void PrintView::mouseMoveEvent(QMouseEvent *event) {
@@ -401,29 +497,72 @@ void PrintView::mouseMoveEvent(QMouseEvent *event) {
     } else if (m_dragging_object && (event->buttons() & Qt::LeftButton) &&
                m_transform_handler) {
         if (m_gizmo_mode == GizmoMode::Move) {
-            const float radius = std::max(m_build_volume.x(), m_build_volume.y()) * 0.58f;
-            const float scale = 2.0f * radius / (std::max(1, height()) * m_zoom);
-            m_transform_handler(m_gizmo_mode,
-                                QVector3D(float(delta.x()) * scale,
-                                          float(-delta.y()) * scale, 0.0f));
+            QVector3D world;
+            QVector3D total;
+            if (m_drag_unproject_valid && unprojectToDragPlane(event->position(), world)) {
+                total = world - m_drag_start_world;
+            } else {
+                const QPointF screen = event->position() - m_press_mouse;
+                const float yaw = qDegreesToRadians(m_yaw);
+                const QVector3D right(std::cos(yaw), std::sin(yaw), 0.0f);
+                QVector3D forward = cameraForward();
+                forward.setZ(0.0f);
+                if (!forward.isNull())
+                    forward.normalize();
+                total = (right * float(screen.x()) + forward * float(-screen.y())) *
+                        worldUnitsPerPixel();
+            }
+            total.setZ(0.0f);
+            const QVector3D snapped(std::round(total.x()), std::round(total.y()), 0.0f);
+            const QVector3D increment = snapped - m_drag_emitted_move;
+            if (!increment.isNull()) {
+                m_transform_handler(m_gizmo_mode, increment);
+                m_drag_emitted_move = snapped;
+            }
         } else if (m_gizmo_mode == GizmoMode::Rotate) {
-            m_transform_handler(m_gizmo_mode, QVector3D(0.0f, 0.0f, float(delta.x()) * 0.5f));
+            const QPointF radial(event->position().x() - m_gizmo_screen_center.x(),
+                                 m_gizmo_screen_center.y() - event->position().y());
+            const float radius = float(std::hypot(radial.x(), radial.y()));
+            float angle_increment = 0.0f;
+            if (radius >= 10.0f && m_drag_start_radius >= 10.0f) {
+                const float angle = std::atan2(float(radial.y()), float(radial.x()));
+                angle_increment = std::remainder(angle - m_drag_last_angle,
+                                                 2.0f * float(M_PI));
+                m_drag_last_angle = angle;
+            } else {
+                angle_increment = float(delta.x()) * qDegreesToRadians(0.5f);
+            }
+            m_drag_angle_total += qRadiansToDegrees(angle_increment);
+            const float snapped = std::round(m_drag_angle_total / 15.0f) * 15.0f;
+            const float increment = snapped - m_drag_emitted_angle;
+            if (std::abs(increment) >= 0.1f) {
+                m_transform_handler(m_gizmo_mode, m_drag_rotation_axis * increment);
+                m_drag_emitted_angle = snapped;
+            }
         } else {
-            const float factor = std::exp(float(-delta.y()) * 0.01f);
-            m_transform_handler(m_gizmo_mode, QVector3D(factor, factor, factor));
+            const QPointF radial(event->position().x() - m_gizmo_screen_center.x(),
+                                 m_gizmo_screen_center.y() - event->position().y());
+            const float radius = float(std::hypot(radial.x(), radial.y()));
+            const int raw_steps = std::lround((radius - m_drag_start_radius) / 28.0f);
+            const int steps = std::max(1 - m_minimum_selected_scale, raw_steps);
+            const int increment = steps - m_drag_emitted_scale_steps;
+            if (increment != 0) {
+                m_transform_handler(m_gizmo_mode,
+                                    QVector3D(increment, increment, increment));
+                m_drag_emitted_scale_steps = steps;
+            }
         }
     } else {
         const bool pan = (event->buttons() & (Qt::MiddleButton | Qt::RightButton)) ||
                          ((event->buttons() & Qt::LeftButton) &&
                           (event->modifiers() & Qt::ShiftModifier));
         if (pan) {
-            const float radius = std::max(m_build_volume.x(), m_build_volume.y()) * 0.58f;
-            const float scale = 2.0f * radius / (std::max(1, height()) * m_zoom);
+            const float scale = worldUnitsPerPixel();
             m_pan += QVector2D(float(delta.x()) * scale, float(-delta.y()) * scale);
             update();
         } else if ((event->buttons() & Qt::LeftButton) && m_pressed_object < 0) {
             m_yaw += float(delta.x()) * 0.5f;
-            m_pitch = std::clamp(m_pitch + float(delta.y()) * 0.5f, -89.0f, 89.0f);
+            m_pitch = std::clamp(m_pitch + float(delta.y()) * 0.5f, -89.9f, 89.9f);
             update();
         }
     }
@@ -431,14 +570,25 @@ void PrintView::mouseMoveEvent(QMouseEvent *event) {
 }
 
 void PrintView::mouseReleaseEvent(QMouseEvent *) {
+    const bool finished_transform = m_dragging_object;
     m_dragging_object = false;
     m_pressed_object = -1;
+    if (finished_transform && m_transform_finished_handler)
+        m_transform_finished_handler();
 }
 
 void PrintView::wheelEvent(QWheelEvent *event) {
     if (m_layer_mode) {
-        m_layer_zoom = std::clamp(
-            m_layer_zoom * std::exp(float(event->angleDelta().y()) / 900.0f), 0.1f, 40.0f);
+        const float previous = m_layer_zoom;
+        const float next = std::clamp(
+            previous * std::exp(float(event->angleDelta().y()) / 900.0f), 0.1f, 40.0f);
+        if (next != previous) {
+            const QVector2D cursor(float(event->position().x() - width() * 0.5),
+                                   float(event->position().y() - height() * 0.5));
+            const float ratio = next / previous;
+            m_layer_pan = cursor - (cursor - m_layer_pan) * ratio;
+            m_layer_zoom = next;
+        }
     } else {
         m_zoom = std::clamp(m_zoom * std::exp(float(event->angleDelta().y()) / 900.0f),
                             0.15f, 8.0f);

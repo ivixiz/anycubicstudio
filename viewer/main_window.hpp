@@ -4,6 +4,7 @@
 
 #include <QMainWindow>
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -16,6 +17,7 @@ class QComboBox;
 class QDoubleSpinBox;
 class QDragEnterEvent;
 class QDropEvent;
+class QEvent;
 class QKeyEvent;
 class QLabel;
 class QLineEdit;
@@ -32,14 +34,30 @@ public:
     explicit MainWindow(const QStringList &initial_files = {}, QWidget *parent = nullptr,
                         bool non_interactive = false);
     std::size_t importedObjectCount() const noexcept { return m_objects.size(); }
+    bool runHistorySmokeTest(QString &error);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+    struct EditorSnapshot {
+        std::vector<SceneObject> objects;
+        SupportSettings default_supports;
+        PcbSettings default_pcb;
+        std::array<double, 3> zone{};
+        double layer_height = 0.05;
+        int bottom_layers = 5;
+        double bottom_exposure = 28.0;
+        double exposure = 1.8;
+        double lift_height = 8.0;
+        double lift_speed = 6.0;
+        double off_time = 0.5;
+    };
+
     void buildInterface();
     QWidget *buildCentre();
     QWidget *buildTransformPanel();
@@ -74,6 +92,7 @@ private:
     void resetTransform();
     void centreSelection();
     void placeSelectionOnBed();
+    void snapArtworkSelection();
     void applySupportPreset(int index);
     void addManualSupport();
     void removeManualSupport();
@@ -82,11 +101,15 @@ private:
     void transformVisual(SceneObject &object, int mode, const QVector3D &delta);
     void scheduleRebuild();
     void rebuildSelectedPreviews();
+    void rebuildArtworkPreviews();
     bool rebuildObject(SceneObject &object, bool show_error = true);
 
     void updateLayerControls();
     void updateLayerLabel(int layer);
     void printingZoneChanged();
+    void printSettingsChanged();
+    void recordPrintSettingsHistory();
+    void syncPrintSettingsHistoryBaseline();
     void invalidateSlice();
     void updateActions();
     bool sliceScene();
@@ -116,6 +139,14 @@ private:
                                const SceneObject *isolated = nullptr,
                                bool expose_isolated_drill = false) const;
     void appendLog(const QString &text);
+    EditorSnapshot captureSnapshot() const;
+    void restoreSnapshot(const EditorSnapshot &snapshot);
+    void recordHistory(bool coalesce);
+    void pushHistory(EditorSnapshot snapshot);
+    void undo();
+    void redo();
+    void transformGestureFinished();
+    void updateHistoryActions();
 
     PrintView *m_view = nullptr;
     QListWidget *m_object_list = nullptr;
@@ -176,6 +207,8 @@ private:
     QSpinBox *m_exposure_duration = nullptr;
 
     QAction *m_layout_action = nullptr;
+    QAction *m_undo_action = nullptr;
+    QAction *m_redo_action = nullptr;
     QAction *m_slice_action = nullptr;
     QAction *m_run_action = nullptr;
     QAction *m_pause_action = nullptr;
@@ -183,6 +216,7 @@ private:
     QAction *m_stop_action = nullptr;
     QAction *m_status_action = nullptr;
     QTimer *m_rebuild_timer = nullptr;
+    QTimer *m_history_timer = nullptr;
 
     std::vector<std::unique_ptr<SceneObject>> m_objects;
     SupportSettings m_default_supports;
@@ -194,5 +228,19 @@ private:
     double m_last_pcb_exposure = 0.0;
     bool m_loading_controls = false;
     bool m_non_interactive = false;
+    bool m_history_enabled = false;
+    bool m_restoring_history = false;
+    bool m_history_coalescing = false;
+    bool m_gizmo_history_recorded = false;
+    std::vector<EditorSnapshot> m_undo_history;
+    std::vector<EditorSnapshot> m_redo_history;
+    std::array<double, 3> m_history_zone{};
+    double m_history_layer_height = 0.05;
+    int m_history_bottom_layers = 5;
+    double m_history_bottom_exposure = 28.0;
+    double m_history_exposure = 1.8;
+    double m_history_lift_height = 8.0;
+    double m_history_lift_speed = 6.0;
+    double m_history_off_time = 0.5;
     quint64 m_next_object_id = 1;
 };

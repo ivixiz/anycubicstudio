@@ -32,6 +32,7 @@
 #include <QLineEdit>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QMenuBar>
 #include <QMimeData>
 #include <QPlainTextEdit>
 #include <QProcess>
@@ -126,10 +127,10 @@ QString sourceTypeJson(SceneObjectType type) {
     }
 }
 
-QJsonObject transformJson(const SceneObject &object) {
+QJsonObject transformJson(const SceneObject &object, bool automatic_front_group) {
     QVector3D scale = object.scale;
     const bool automatic_front = object.isArtwork() && object.pcb.auto_mirror &&
-                                 filenameSuggestsFrontMirror(object.path);
+                                 automatic_front_group;
     if (object.mirror_x || automatic_front)
         scale.setX(-scale.x());
     if (object.mirror_y)
@@ -182,17 +183,29 @@ MainWindow::MainWindow(const QStringList &initial_files, QWidget *parent, bool n
     resize(1500, 900);
     setAcceptDrops(true);
     buildInterface();
+    qApp->installEventFilter(this);
     connectActions();
     loadSettings();
     printingZoneChanged();
     if (!initial_files.isEmpty())
         importPaths(initial_files);
     updateActions();
+    syncPrintSettingsHistoryBaseline();
+    m_history_enabled = true;
+    updateHistoryActions();
     if (QFileInfo(m_cloud_config->text()).isFile())
         QTimer::singleShot(0, this, [this] { connectToCloud(false); });
 }
 
 void MainWindow::buildInterface() {
+    auto *edit_menu = menuBar()->addMenu("&Edit");
+    m_undo_action = edit_menu->addAction("Undo");
+    m_undo_action->setShortcut(QKeySequence::Undo);
+    m_redo_action = edit_menu->addAction("Redo");
+    m_redo_action->setShortcut(QKeySequence("Ctrl+Shift+Z"));
+    connect(m_undo_action, &QAction::triggered, this, [this] { undo(); });
+    connect(m_redo_action, &QAction::triggered, this, [this] { redo(); });
+
     auto *toolbar = addToolBar("Workflow");
     toolbar->setObjectName("workflowToolbar");
     toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -286,6 +299,12 @@ void MainWindow::buildInterface() {
     m_rebuild_timer->setInterval(180);
     connect(m_rebuild_timer, &QTimer::timeout, this,
             [this] { rebuildSelectedPreviews(); });
+    m_history_timer = new QTimer(this);
+    m_history_timer->setSingleShot(true);
+    m_history_timer->setInterval(400);
+    connect(m_history_timer, &QTimer::timeout, this, [this] {
+        m_history_coalescing = false;
+    });
     appendLog("Unified scene ready. Slice prepares a PWSZ; Run only uploads and starts it.");
 }
 
@@ -348,9 +367,9 @@ QWidget *MainWindow::buildTransformPanel() {
     auto *layout = new QVBoxLayout(panel);
     auto *form = new QFormLayout;
     for (int axis = 0; axis < 3; ++axis) {
-        m_move[axis] = spin(-1000.0, 1000.0, 0.0);
-        m_rotate[axis] = spin(-360.0, 360.0, 0.0, 2, 5.0);
-        m_scale[axis] = spin(0.001, 1000.0, 1.0, 4, 0.05);
+        m_move[axis] = spin(-1000.0, 1000.0, 0.0, 3, 1.0);
+        m_rotate[axis] = spin(-360.0, 360.0, 0.0, 1, 15.0);
+        m_scale[axis] = spin(1.0, 1000.0, 1.0, 0, 1.0);
         m_mirror[axis] = new QCheckBox(QString(QChar('X' + axis)));
     }
     form->addRow("Move X/Y/Z (mm)", rowOf({m_move[0], m_move[1], m_move[2]}));
@@ -361,8 +380,9 @@ QWidget *MainWindow::buildTransformPanel() {
     auto *centre = new QPushButton("Center X/Y");
     auto *bed = new QPushButton("Place on bed");
     auto *reset = new QPushButton("Reset transform");
+    auto *snap_pcb = new QPushButton("Snap PCB layers");
     layout->addWidget(rowOf({centre, bed}));
-    layout->addWidget(reset);
+    layout->addWidget(rowOf({reset, snap_pcb}));
     auto *note = new QLabel(
         "Values are live and apply to all selected objects. Gerber/DRL use Z rotation and "
         "uniform XY scale; a detected KiCad F_* layer starts with Mirror X active.");
@@ -383,6 +403,7 @@ QWidget *MainWindow::buildTransformPanel() {
     connect(centre, &QPushButton::clicked, this, [this] { centreSelection(); });
     connect(bed, &QPushButton::clicked, this, [this] { placeSelectionOnBed(); });
     connect(reset, &QPushButton::clicked, this, [this] { resetTransform(); });
+    connect(snap_pcb, &QPushButton::clicked, this, [this] { snapArtworkSelection(); });
     return panel;
 }
 
@@ -544,9 +565,9 @@ QWidget *MainWindow::buildPrintPanel() {
     for (QDoubleSpinBox *value : {m_layer_height, m_bottom_exposure, m_exposure,
                                   m_lift_height, m_lift_speed, m_off_time})
         connect(value, &QDoubleSpinBox::valueChanged, this,
-                [this] { invalidateSlice(); });
+                [this] { printSettingsChanged(); });
     connect(m_bottom_layers, &QSpinBox::valueChanged, this,
-            [this] { invalidateSlice(); });
+            [this] { printSettingsChanged(); });
     return content;
 }
 
@@ -608,6 +629,7 @@ void MainWindow::connectActions() {
     m_view->setTransformHandler([this](PrintView::GizmoMode mode, QVector3D delta) {
         gizmoTransform(static_cast<int>(mode), delta);
     });
+    m_view->setTransformFinishedHandler([this] { transformGestureFinished(); });
 }
 
 void MainWindow::loadSettings() {
@@ -753,6 +775,25 @@ void MainWindow::keyPressEvent(QKeyEvent *event) {
     QMainWindow::keyPressEvent(event);
 }
 
+bool MainWindow::eventFilter(QObject *watched, QEvent *event) {
+    if (event->type() == QEvent::KeyPress && QApplication::activeWindow() == this) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        const auto modifiers = key->modifiers() &
+                               (Qt::ControlModifier | Qt::ShiftModifier | Qt::AltModifier |
+                                Qt::MetaModifier);
+        if (key->key() == Qt::Key_Z &&
+            modifiers == (Qt::ControlModifier | Qt::ShiftModifier)) {
+            redo();
+            return true;
+        }
+        if (key->key() == Qt::Key_Z && modifiers == Qt::ControlModifier) {
+            undo();
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::importDialog() {
     importPaths(QFileDialog::getOpenFileNames(
         this, "Import objects", QString(),
@@ -761,17 +802,26 @@ void MainWindow::importDialog() {
 }
 
 void MainWindow::importPaths(const QStringList &paths) {
+    std::optional<EditorSnapshot> before;
+    if (m_history_enabled && !m_restoring_history)
+        before = captureSnapshot();
     int imported = 0;
     for (const QString &path : paths)
         imported += importPath(path) ? 1 : 0;
     if (imported == 0)
         return;
+    if (before)
+        pushHistory(std::move(*before));
     for (auto &object : m_objects)
         object->selected = false;
     m_objects.back()->selected = true;
     refreshObjectList();
     refreshView();
     refreshPropertyPanels();
+    if (std::count_if(m_objects.begin(), m_objects.end(), [](const auto &object) {
+            return object->visible && object->isArtwork();
+        }) > 1)
+        rebuildArtworkPreviews();
     invalidateSlice();
 }
 
@@ -871,7 +921,10 @@ void MainWindow::selectionFromList() {
 
 void MainWindow::selectionFromView(int index, Qt::KeyboardModifiers modifiers) {
     const bool extend = modifiers & (Qt::ControlModifier | Qt::ShiftModifier);
-    if (!extend)
+    const bool keep_group = !extend && index >= 0 &&
+                            index < static_cast<int>(m_objects.size()) &&
+                            m_objects[index]->selected;
+    if (!extend && !keep_group)
         for (auto &object : m_objects)
             object->selected = false;
     if (index >= 0 && index < static_cast<int>(m_objects.size())) {
@@ -901,6 +954,20 @@ void MainWindow::refreshObjectList() {
 void MainWindow::refreshView() {
     m_view->setObjects(m_objects);
     m_view->setLayers(m_sliced_layers);
+    const auto selected = selectedObjects();
+    m_view->setRotationZOnly(!selected.empty() &&
+                             std::all_of(selected.begin(), selected.end(),
+                                         [](const SceneObject *object) {
+                                             return object->isArtwork();
+                                         }));
+    float minimum_scale = std::numeric_limits<float>::max();
+    for (const SceneObject *object : selected) {
+        minimum_scale = std::min(minimum_scale, object->scale.x());
+        minimum_scale = std::min(minimum_scale, object->scale.y());
+        if (object->isModel())
+            minimum_scale = std::min(minimum_scale, object->scale.z());
+    }
+    m_view->setMinimumSelectedScale(selected.empty() ? 1.0f : minimum_scale);
     updateLayerControls();
 }
 
@@ -922,6 +989,12 @@ void MainWindow::refreshPropertyPanels() {
 void MainWindow::loadTransformControls() {
     const auto selected = selectedObjects();
     const SceneObject *object = selected.empty() ? nullptr : selected.front();
+    const bool automatic_front_group = std::any_of(
+        m_objects.begin(), m_objects.end(), [](const auto &candidate) {
+            return candidate->visible && candidate->type == SceneObjectType::Gerber &&
+                   candidate->pcb.auto_mirror &&
+                   filenameSuggestsFrontMirror(candidate->path);
+        });
     m_loading_controls = true;
     for (int axis = 0; axis < 3; ++axis) {
         m_move[axis]->setEnabled(object && object->editable);
@@ -935,7 +1008,7 @@ void MainWindow::loadTransformControls() {
         if (object) {
             mirror = axis == 0   ? object->mirror_x ||
                                       (object->isArtwork() && object->pcb.auto_mirror &&
-                                       filenameSuggestsFrontMirror(object->path))
+                                       automatic_front_group)
                      : axis == 1 ? object->mirror_y
                                  : object->mirror_z;
         }
@@ -1017,6 +1090,7 @@ void MainWindow::loadPcbControls() {
 void MainWindow::applyTransformLive() {
     if (m_loading_controls)
         return;
+    recordHistory(true);
     for (SceneObject *object : selectedObjects()) {
         if (!object->editable)
             continue;
@@ -1045,6 +1119,7 @@ void MainWindow::applyTransformLive() {
 void MainWindow::applySupportsLive() {
     if (m_loading_controls)
         return;
+    recordHistory(true);
     for (SceneObject *object : selectedObjects()) {
         if (!object->isModel())
             continue;
@@ -1073,6 +1148,7 @@ void MainWindow::applySupportsLive() {
 void MainWindow::applyPcbLive() {
     if (m_loading_controls)
         return;
+    recordHistory(true);
     for (SceneObject *object : selectedObjects()) {
         if (!object->isArtwork())
             continue;
@@ -1105,6 +1181,60 @@ void MainWindow::centreSelection() {
 }
 
 void MainWindow::placeSelectionOnBed() { m_move[2]->setValue(0.0); }
+
+void MainWindow::snapArtworkSelection() {
+    std::vector<SceneObject *> selected_artwork;
+    for (SceneObject *object : selectedObjects())
+        if (object->isArtwork() && object->editable)
+            selected_artwork.push_back(object);
+    if (selected_artwork.empty()) {
+        QMessageBox::information(this, "Snap PCB layers",
+                                 "Select a Gerber or drill layer to use as the anchor.");
+        return;
+    }
+    SceneObject *anchor = selected_artwork.front();
+    const auto gerber = std::find_if(selected_artwork.begin(), selected_artwork.end(),
+                                     [](const SceneObject *object) {
+                                         return object->type == SceneObjectType::Gerber;
+                                     });
+    if (gerber != selected_artwork.end())
+        anchor = *gerber;
+    std::vector<SceneObject *> targets = selected_artwork;
+    if (targets.size() == 1) {
+        targets.clear();
+        for (auto &object : m_objects)
+            if (object->visible && object->isArtwork() && object->editable)
+                targets.push_back(object.get());
+    }
+    if (targets.size() < 2) {
+        QMessageBox::information(this, "Snap PCB layers",
+                                 "Import at least two Gerber/DRL layers to align them.");
+        return;
+    }
+    recordHistory(false);
+    const bool automatic_front_group = std::any_of(
+        m_objects.begin(), m_objects.end(), [](const auto &object) {
+            return object->visible && object->type == SceneObjectType::Gerber &&
+                   object->pcb.auto_mirror && filenameSuggestsFrontMirror(object->path);
+        });
+    const bool mirror_x = anchor->mirror_x ||
+                          (anchor->pcb.auto_mirror && automatic_front_group);
+    for (SceneObject *object : targets) {
+        object->move = anchor->move;
+        object->rotate = QVector3D(0.0f, 0.0f, anchor->rotate.z());
+        object->scale = QVector3D(anchor->scale.x(), anchor->scale.x(), 1.0f);
+        object->mirror_x = mirror_x;
+        object->mirror_y = anchor->mirror_y;
+        object->mirror_z = false;
+        object->pcb.auto_mirror = false;
+    }
+    appendLog(QString("Snapped %1 PCB layers to %2.")
+                  .arg(targets.size())
+                  .arg(anchor->display_name));
+    loadTransformControls();
+    rebuildArtworkPreviews();
+    invalidateSlice();
+}
 
 void MainWindow::applySupportPreset(int index) {
     if (m_loading_controls || index == 0)
@@ -1150,6 +1280,7 @@ void MainWindow::addManualSupport() {
     point.contact = QVector3D(values[0], values[1], values[2]);
     if (fields.size() == 4)
         point.base_z = values[3];
+    recordHistory(false);
     model->supports.manual.push_back(point);
     model->supports.enabled = true;
     refreshManualSupports();
@@ -1161,6 +1292,7 @@ void MainWindow::removeManualSupport() {
     const int row = m_manual_supports->currentRow();
     if (!model || row < 0 || row >= static_cast<int>(model->supports.manual.size()))
         return;
+    recordHistory(false);
     model->supports.manual.erase(model->supports.manual.begin() + row);
     refreshManualSupports();
     invalidateSlice();
@@ -1180,7 +1312,14 @@ void MainWindow::refreshManualSupports() {
 }
 
 void MainWindow::deleteSelection() {
+    const bool removing_artwork = std::any_of(
+        m_objects.begin(), m_objects.end(),
+        [](const auto &object) { return object->selected && object->isArtwork(); });
     const auto old_size = m_objects.size();
+    if (!std::any_of(m_objects.begin(), m_objects.end(),
+                     [](const auto &object) { return object->selected; }))
+        return;
+    recordHistory(false);
     m_objects.erase(std::remove_if(m_objects.begin(), m_objects.end(),
                                    [](const auto &object) { return object->selected; }),
                     m_objects.end());
@@ -1189,6 +1328,8 @@ void MainWindow::deleteSelection() {
     refreshObjectList();
     refreshView();
     refreshPropertyPanels();
+    if (removing_artwork)
+        rebuildArtworkPreviews();
     invalidateSlice();
 }
 
@@ -1207,6 +1348,8 @@ void MainWindow::autoLayout() {
     double cursor_x = min_x;
     double cursor_y = min_y;
     double row_depth = 0.0;
+    std::vector<QVector3D> deltas;
+    deltas.reserve(objects.size());
     for (SceneObject *object : objects) {
         const double width = object->visual.maximum.x() - object->visual.minimum.x();
         const double depth = object->visual.maximum.y() - object->visual.minimum.y();
@@ -1221,11 +1364,16 @@ void MainWindow::autoLayout() {
         }
         const QVector3D current = (object->visual.minimum + object->visual.maximum) * 0.5f;
         const QVector3D target(cursor_x + width * 0.5, cursor_y + depth * 0.5, current.z());
-        const QVector3D delta = target - current;
-        object->move += delta;
-        transformVisual(*object, static_cast<int>(PrintView::GizmoMode::Move), delta);
+        deltas.push_back(target - current);
         cursor_x += width + margin;
         row_depth = std::max(row_depth, depth);
+    }
+    recordHistory(false);
+    for (std::size_t index = 0; index < objects.size(); ++index) {
+        SceneObject *object = objects[index];
+        const QVector3D delta = deltas[index];
+        object->move += delta;
+        transformVisual(*object, static_cast<int>(PrintView::GizmoMode::Move), delta);
     }
     loadTransformControls();
     refreshView();
@@ -1233,37 +1381,63 @@ void MainWindow::autoLayout() {
 }
 
 void MainWindow::gizmoTransform(int mode, const QVector3D &delta) {
+    if (!m_gizmo_history_recorded) {
+        recordHistory(false);
+        m_gizmo_history_recorded = true;
+    }
     for (SceneObject *object : selectedObjects()) {
         if (!object->editable)
             continue;
-        if (mode == static_cast<int>(PrintView::GizmoMode::Move))
-            object->move += delta;
-        else if (mode == static_cast<int>(PrintView::GizmoMode::Rotate))
-            object->rotate += delta;
-        else
-            object->scale *= delta;
-        transformVisual(*object, mode, delta);
+        QVector3D applied = delta;
+        if (mode == static_cast<int>(PrintView::GizmoMode::Move)) {
+            if (object->isArtwork() && object->move.z() + applied.z() < 0.0f)
+                applied.setZ(-object->move.z());
+            object->move += applied;
+        } else if (mode == static_cast<int>(PrintView::GizmoMode::Rotate)) {
+            if (object->isArtwork())
+                applied = QVector3D(0.0f, 0.0f, applied.z());
+            object->rotate += applied;
+            object->rotate.setX(std::remainder(object->rotate.x(), 360.0f));
+            object->rotate.setY(std::remainder(object->rotate.y(), 360.0f));
+            object->rotate.setZ(std::remainder(object->rotate.z(), 360.0f));
+        } else {
+            const QVector3D previous = object->scale;
+            QVector3D next(std::max(1.0f, std::round(previous.x() + applied.x())),
+                           std::max(1.0f, std::round(previous.y() + applied.y())),
+                           std::max(1.0f, std::round(previous.z() + applied.z())));
+            if (object->isArtwork())
+                next = QVector3D(next.x(), next.x(), 1.0f);
+            object->scale = next;
+            applied = QVector3D(next.x() / previous.x(), next.y() / previous.y(),
+                                next.z() / previous.z());
+        }
+        transformVisual(*object, mode, applied);
     }
     loadTransformControls();
     refreshView();
     invalidateSlice();
 }
 
+void MainWindow::transformGestureFinished() {
+    if (m_gizmo_history_recorded)
+        scheduleRebuild();
+    m_gizmo_history_recorded = false;
+}
+
 void MainWindow::transformVisual(SceneObject &object, int mode, const QVector3D &delta) {
     const QVector3D centre = (object.visual.minimum + object.visual.maximum) * 0.5f;
-    const float radians = delta.z() * float(M_PI / 180.0);
+    QMatrix4x4 rotation;
+    rotation.rotate(delta.x(), 1.0f, 0.0f, 0.0f);
+    rotation.rotate(delta.y(), 0.0f, 1.0f, 0.0f);
+    rotation.rotate(delta.z(), 0.0f, 0.0f, 1.0f);
     auto transform = [&](QVector3D point) {
         if (mode == static_cast<int>(PrintView::GizmoMode::Move))
             return point + delta;
         point -= centre;
-        if (mode == static_cast<int>(PrintView::GizmoMode::Rotate)) {
-            const float x = point.x() * std::cos(radians) - point.y() * std::sin(radians);
-            const float y = point.x() * std::sin(radians) + point.y() * std::cos(radians);
-            point.setX(x);
-            point.setY(y);
-        } else {
+        if (mode == static_cast<int>(PrintView::GizmoMode::Rotate))
+            point = rotation.map(point);
+        else
             point *= delta;
-        }
         return point + centre;
     };
     auto transform_vertices = [&](QVector<float> &vertices) {
@@ -1327,6 +1501,14 @@ void MainWindow::rebuildSelectedPreviews() {
     refreshView();
 }
 
+void MainWindow::rebuildArtworkPreviews() {
+    for (auto &object : m_objects)
+        if (object->editable && object->visible && object->isArtwork() &&
+            !rebuildObject(*object, false))
+            appendLog("PCB preview rebuild failed for " + object->display_name);
+    refreshView();
+}
+
 bool MainWindow::rebuildObject(SceneObject &object, bool show_error) {
     QString project_path;
     QString error;
@@ -1337,8 +1519,13 @@ bool MainWindow::rebuildObject(SceneObject &object, bool show_error) {
         return false;
     }
     const QString scene_path = makeTemporaryPath(".acv");
-    const ProcessResult result = runRust({"project-viewer-scene", project_path, scene_path},
-                                         "Preparing " + object.display_name,
+    const QString operation = object.isArtwork() ? "project-object-viewer-scene"
+                                                 : "project-viewer-scene";
+    QStringList arguments{operation, project_path};
+    if (object.isArtwork())
+        arguments.append("0");
+    arguments.append(scene_path);
+    const ProcessResult result = runRust(arguments, "Preparing " + object.display_name,
                                          60 * 60 * 1000);
     QFile::remove(project_path);
     if (!result.ok) {
@@ -1378,11 +1565,57 @@ void MainWindow::updateLayerLabel(int layer) {
 }
 
 void MainWindow::printingZoneChanged() {
+    if (m_restoring_history)
+        return;
     if (!m_view || !m_zone[0])
         return;
+    recordPrintSettingsHistory();
     m_view->setBuildVolume(
         QVector3D(m_zone[0]->value(), m_zone[1]->value(), m_zone[2]->value()));
     invalidateSlice();
+}
+
+void MainWindow::printSettingsChanged() {
+    if (m_restoring_history)
+        return;
+    recordPrintSettingsHistory();
+    invalidateSlice();
+}
+
+void MainWindow::recordPrintSettingsHistory() {
+    if (!m_history_enabled || m_restoring_history) {
+        syncPrintSettingsHistoryBaseline();
+        return;
+    }
+    if (!m_history_coalescing) {
+        EditorSnapshot before = captureSnapshot();
+        before.zone = m_history_zone;
+        before.layer_height = m_history_layer_height;
+        before.bottom_layers = m_history_bottom_layers;
+        before.bottom_exposure = m_history_bottom_exposure;
+        before.exposure = m_history_exposure;
+        before.lift_height = m_history_lift_height;
+        before.lift_speed = m_history_lift_speed;
+        before.off_time = m_history_off_time;
+        pushHistory(std::move(before));
+        m_history_coalescing = true;
+    }
+    m_history_timer->start();
+    syncPrintSettingsHistoryBaseline();
+}
+
+void MainWindow::syncPrintSettingsHistoryBaseline() {
+    if (!m_zone[0])
+        return;
+    for (int axis = 0; axis < 3; ++axis)
+        m_history_zone[axis] = m_zone[axis]->value();
+    m_history_layer_height = m_layer_height->value();
+    m_history_bottom_layers = m_bottom_layers->value();
+    m_history_bottom_exposure = m_bottom_exposure->value();
+    m_history_exposure = m_exposure->value();
+    m_history_lift_height = m_lift_height->value();
+    m_history_lift_speed = m_lift_speed->value();
+    m_history_off_time = m_off_time->value();
 }
 
 void MainWindow::invalidateSlice() {
@@ -1811,6 +2044,14 @@ QByteArray MainWindow::projectJson(const SceneObject *isolated,
                              {"xy_offset_mm", 0.0},
                              {"hollow", false},
                              {"gmsh_path", "gmsh"}};
+    const bool automatic_front_group =
+        (isolated && isolated->type == SceneObjectType::Gerber &&
+         isolated->pcb.auto_mirror && filenameSuggestsFrontMirror(isolated->path)) ||
+        std::any_of(m_objects.begin(), m_objects.end(), [](const auto &candidate) {
+            return candidate->visible && candidate->type == SceneObjectType::Gerber &&
+                   candidate->pcb.auto_mirror &&
+                   filenameSuggestsFrontMirror(candidate->path);
+        });
     QJsonArray objects;
     const auto append_object = [&](const SceneObject *object) {
         if (!object || !object->editable || (!isolated && !object->visible))
@@ -1827,7 +2068,7 @@ QByteArray MainWindow::projectJson(const SceneObject *isolated,
         objects.append(QJsonObject{{"input", object->path},
                                    {"source_type", sourceTypeJson(object->type)},
                                    {"visible", true},
-                                   {"transform", transformJson(*object)},
+                                   {"transform", transformJson(*object, automatic_front_group)},
                                    {"supports", supportJson(object->supports)},
                                    {"pcb", pcb}});
     };
@@ -1836,6 +2077,10 @@ QByteArray MainWindow::projectJson(const SceneObject *isolated,
         // to m_objects, so it must be serialized directly rather than found in
         // the current scene collection.
         append_object(isolated);
+        if (isolated->isArtwork())
+            for (const auto &owned : m_objects)
+                if (owned.get() != isolated && owned->visible && owned->isArtwork())
+                    append_object(owned.get());
     } else {
         for (const auto &owned : m_objects)
             append_object(owned.get());
@@ -1871,6 +2116,167 @@ bool MainWindow::writeTemporaryProject(QString &path, QString &error,
     if (file.write(projectJson(isolated, expose_isolated_drill)) < 0) {
         error = file.errorString();
         file.remove();
+        return false;
+    }
+    return true;
+}
+
+MainWindow::EditorSnapshot MainWindow::captureSnapshot() const {
+    EditorSnapshot snapshot;
+    snapshot.objects.reserve(m_objects.size());
+    for (const auto &object : m_objects)
+        snapshot.objects.push_back(*object);
+    snapshot.default_supports = m_default_supports;
+    snapshot.default_pcb = m_default_pcb;
+    for (int axis = 0; axis < 3; ++axis)
+        snapshot.zone[axis] = m_zone[axis]->value();
+    snapshot.layer_height = m_layer_height->value();
+    snapshot.bottom_layers = m_bottom_layers->value();
+    snapshot.bottom_exposure = m_bottom_exposure->value();
+    snapshot.exposure = m_exposure->value();
+    snapshot.lift_height = m_lift_height->value();
+    snapshot.lift_speed = m_lift_speed->value();
+    snapshot.off_time = m_off_time->value();
+    return snapshot;
+}
+
+void MainWindow::restoreSnapshot(const EditorSnapshot &snapshot) {
+    m_restoring_history = true;
+    m_loading_controls = true;
+    if (m_rebuild_timer)
+        m_rebuild_timer->stop();
+    m_objects.clear();
+    m_objects.reserve(snapshot.objects.size());
+    quint64 maximum_id = 0;
+    for (const SceneObject &object : snapshot.objects) {
+        m_objects.push_back(std::make_unique<SceneObject>(object));
+        maximum_id = std::max(maximum_id, object.id);
+    }
+    m_next_object_id = maximum_id + 1;
+    m_default_supports = snapshot.default_supports;
+    m_default_pcb = snapshot.default_pcb;
+    for (int axis = 0; axis < 3; ++axis)
+        m_zone[axis]->setValue(snapshot.zone[axis]);
+    m_layer_height->setValue(snapshot.layer_height);
+    m_bottom_layers->setValue(snapshot.bottom_layers);
+    m_bottom_exposure->setValue(snapshot.bottom_exposure);
+    m_exposure->setValue(snapshot.exposure);
+    m_lift_height->setValue(snapshot.lift_height);
+    m_lift_speed->setValue(snapshot.lift_speed);
+    m_off_time->setValue(snapshot.off_time);
+    m_loading_controls = false;
+    m_restoring_history = false;
+    syncPrintSettingsHistoryBaseline();
+    m_view->setBuildVolume(
+        QVector3D(snapshot.zone[0], snapshot.zone[1], snapshot.zone[2]));
+    refreshObjectList();
+    refreshView();
+    refreshPropertyPanels();
+    invalidateSlice();
+}
+
+void MainWindow::pushHistory(EditorSnapshot snapshot) {
+    if (!m_history_enabled || m_restoring_history)
+        return;
+    m_history_coalescing = false;
+    if (m_history_timer)
+        m_history_timer->stop();
+    m_undo_history.push_back(std::move(snapshot));
+    // Scene previews can contain millions of contour/vertex values; keep a
+    // bounded but useful history instead of allowing snapshots to exhaust RAM.
+    if (m_undo_history.size() > 20)
+        m_undo_history.erase(m_undo_history.begin());
+    m_redo_history.clear();
+    updateHistoryActions();
+}
+
+void MainWindow::recordHistory(bool coalesce) {
+    if (!m_history_enabled || m_restoring_history)
+        return;
+    if (coalesce && m_history_coalescing) {
+        m_history_timer->start();
+        return;
+    }
+    pushHistory(captureSnapshot());
+    if (coalesce) {
+        m_history_coalescing = true;
+        m_history_timer->start();
+    }
+}
+
+void MainWindow::undo() {
+    if (m_undo_history.empty())
+        return;
+    m_history_coalescing = false;
+    m_history_timer->stop();
+    m_redo_history.push_back(captureSnapshot());
+    EditorSnapshot snapshot = std::move(m_undo_history.back());
+    m_undo_history.pop_back();
+    restoreSnapshot(snapshot);
+    updateHistoryActions();
+}
+
+void MainWindow::redo() {
+    if (m_redo_history.empty())
+        return;
+    m_history_coalescing = false;
+    m_history_timer->stop();
+    m_undo_history.push_back(captureSnapshot());
+    EditorSnapshot snapshot = std::move(m_redo_history.back());
+    m_redo_history.pop_back();
+    restoreSnapshot(snapshot);
+    updateHistoryActions();
+}
+
+void MainWindow::updateHistoryActions() {
+    if (m_undo_action)
+        m_undo_action->setEnabled(!m_undo_history.empty());
+    if (m_redo_action)
+        m_redo_action->setEnabled(!m_redo_history.empty());
+}
+
+bool MainWindow::runHistorySmokeTest(QString &error) {
+    SceneObject *object = nullptr;
+    for (auto &candidate : m_objects)
+        if (candidate->editable) {
+            object = candidate.get();
+            break;
+        }
+    if (!object) {
+        error = "history smoke test needs one editable scene object";
+        return false;
+    }
+    for (auto &candidate : m_objects)
+        candidate->selected = candidate.get() == object;
+    refreshObjectList();
+    refreshPropertyPanels();
+    const float original_x = object->move.x();
+    m_move[0]->setValue(original_x + 1.0f);
+    m_history_coalescing = false;
+    m_history_timer->stop();
+    undo();
+    if (m_objects.empty() || std::abs(m_objects.front()->move.x() - original_x) > 1.0e-5f) {
+        error = "Ctrl+Z transform state was not restored";
+        return false;
+    }
+    redo();
+    if (m_objects.empty() ||
+        std::abs(m_objects.front()->move.x() - (original_x + 1.0f)) > 1.0e-5f) {
+        error = "Ctrl+Shift+Z transform state was not restored";
+        return false;
+    }
+    const double original_exposure = m_exposure->value();
+    m_exposure->setValue(original_exposure + 0.1);
+    m_history_coalescing = false;
+    m_history_timer->stop();
+    undo();
+    if (std::abs(m_exposure->value() - original_exposure) > 1.0e-6) {
+        error = "Ctrl+Z print setting was not restored";
+        return false;
+    }
+    redo();
+    if (std::abs(m_exposure->value() - (original_exposure + 0.1)) > 1.0e-6) {
+        error = "Ctrl+Shift+Z print setting was not restored";
         return false;
     }
     return true;

@@ -95,6 +95,14 @@ QT_QPA_PLATFORM=offscreen target/release/anycubic-viewer --smoke-import \
 Success ends with `Import smoke test passed: 4 object(s).`; Rust importer
 errors and the command that caused them are written to the terminal.
 
+The same mode can exercise snapshot history after a real import:
+
+```bash
+QT_QPA_PLATFORM=offscreen target/release/anycubic-viewer --smoke-history test/test.stl
+```
+
+It verifies both transform and print-setting Undo/Redo.
+
 `ANYCUBICSTUDIO_CLI=/absolute/path/to/anycubicstudio` can be set when the Qt
 executable and Rust executable are installed in different directories. The GUI
 never reimplements slicing or Cloud packets in C++: it invokes the Rust
@@ -149,10 +157,11 @@ profile because one physical LCD layer cannot have two exposure durations.
    toggles multi-selection; selected objects are orange. Press `Delete` to
    remove the selection. There is intentionally no Remove toolbar button.
 3. Choose Move, Rotate, or Scale in the toolbar and drag a selected object.
-   The coloured gizmo and numeric fields update live. Numeric Move/Rotate/
-   Scale/Mirror edits also apply live; there is no `Apply transform` button.
-   PCB objects use Z rotation and uniform XY scale. `Center X/Y`, `Place on
-   bed`, and `Reset transform` remain shortcuts.
+   Dragging is projected through the current camera instead of treating screen
+   X/Y as fixed world X/Y. Move snaps to 1 mm, Rotate to 15°, and Scale to the
+   positive integer factors 1, 2, 3, 4, and so on. The numeric controls use the
+   same steps and update live. PCB objects use Z rotation and uniform XY scale.
+   `Center X/Y`, `Place on bed`, and `Reset transform` remain shortcuts.
 4. `Auto layout` places the centres of imported objects on non-overlapping
    shelf rows with a 5 mm margin. It refuses the operation if the current
    bounds do not fit the configured plate. It is a deterministic basic layout,
@@ -172,8 +181,8 @@ profile because one physical LCD layer cannot have two exposure durations.
    is applied only to compatible selected objects.
 8. Press `Slice`. It creates the local PWSZ, generates supports, exports the
    exact common layer preview, switches to `Sliced layers`, and enables Run.
-9. Inspect layers with the slider. Wheel zooms, dragging pans, and `Fit view`
-   restores aspect-correct fit.
+9. Inspect layers with the slider. Wheel zooms around the cursor position,
+   dragging pans, and `Fit view` restores aspect-correct fit.
 10. Press `Run` to upload the already prepared PWSZ and, after confirmation,
     start it. Run never invokes Slice implicitly.
 
@@ -189,6 +198,14 @@ Camera controls in 3D mode:
 | middle or right drag | pan |
 | mouse wheel | zoom |
 | `Fit view` | reset camera or fit current 2D layer |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | undo / redo scene and setting changes |
+
+Orbit uses a spherical camera and reaches a perpendicular top/bottom view of
+the XY plate. Move is ray-projected onto the plate plane, with a stable
+camera-relative fallback at an edge-on view. Rotate uses the cursor angle
+around the projected selection centre; Scale uses radial cursor distance.
+One complete mouse drag is one Undo step. Consecutive numeric `valueChanged`
+events are coalesced into a short history transaction.
 
 Switching between `Sliced layer` and `3D model & supports` explicitly restores
 the OpenGL depth state. Front surfaces therefore remain opaque instead of
@@ -396,8 +413,16 @@ When only Gerber/DRL-compatible objects are selected, the PCB tab exposes
 exposure, drill composition, polarity, invert margin and contour simplification.
 The common Transform tab owns mirror, rotate and move. Importing a filename
 containing `F_Cu`, `F_Mask`, `F_Paste`, or `F_Silkscreen` makes the effective X
-mirror active automatically; editing a mirror checkbox turns that into an
-explicit per-object transform. The choice is stored with the scene object.
+mirror active automatically for the complete Gerber/DRL alignment group;
+editing a mirror checkbox turns that into an explicit per-object transform.
+The choice is stored with the scene object.
+
+Every PCB object's 3D preview is exported separately for selection, but uses
+the complete PCB set to calculate the common KiCad source centre. Therefore
+the pre-slice Gerber and drill display uses the same coordinates as final
+slicing. `Snap PCB layers` copies the anchor Gerber's exact translation, Z
+rotation, uniform scale and effective mirror to all selected PCB layers; with
+only one PCB layer selected it aligns every visible PCB layer to that anchor.
 
 Press `Slice` to compose the exact UV layer. The viewer switches to `Sliced
 layers`, where cyan is UV-on and dark is masked. Press `Run` only after that
@@ -1059,6 +1084,7 @@ After sending a control command, run `cloud-projects` again and monitor the stat
 | `viewer-scene <MODEL> <ACV> [SLICE_OPTIONS]`      | Export the internal viewer scene without a GUI   | Local file creation    |
 | `gui [OBJECT ...]`                                | Open the unified model/PCB plate editor          | Local GUI; buttons may invoke Cloud |
 | `project-viewer-scene <JSON> <ACV>`               | Export a unified scene for inspection             | Local file creation    |
+| `project-object-viewer-scene <JSON> <INDEX> <ACV>` | Export one selectable object in the common alignment frame | Local file creation |
 | `project-slice <JSON> <PWSZ>`                     | Slice a serialized model/PCB scene                | Local file creation    |
 | `pcb-default-config <JSON>`                       | Write the default PCB exposure configuration      | Local file creation    |
 | `pcb-viewer-scene <GERBER> <ACV> [PCB_OPTIONS]`   | Compose Gerber/DRL and export exact LCD preview    | Local file creation    |

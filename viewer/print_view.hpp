@@ -23,6 +23,7 @@ public:
     enum class GizmoMode { Move, Rotate, Scale };
     using SelectionHandler = std::function<void(int, Qt::KeyboardModifiers)>;
     using TransformHandler = std::function<void(GizmoMode, QVector3D)>;
+    using TransformFinishedHandler = std::function<void()>;
 
     explicit PrintView(QWidget *parent = nullptr);
     ~PrintView() override;
@@ -37,8 +38,11 @@ public:
     void setLayers(const QVector<LayerData> &layers);
     void setObjects(const std::vector<std::unique_ptr<SceneObject>> &objects);
     void setGizmoMode(GizmoMode mode);
+    void setRotationZOnly(bool enabled);
+    void setMinimumSelectedScale(float scale);
     void setSelectionHandler(SelectionHandler handler);
     void setTransformHandler(TransformHandler handler);
+    void setTransformFinishedHandler(TransformFinishedHandler handler);
     void resetCamera();
     void fitLayer();
 
@@ -76,6 +80,10 @@ private:
                    GLenum primitive);
     void drawLayer();
     QMatrix4x4 currentMvp() const;
+    QVector3D cameraForward() const;
+    float worldUnitsPerPixel() const;
+    QPointF projectPoint(const QVector3D &point, const QMatrix4x4 &mvp) const;
+    bool unprojectToDragPlane(const QPointF &position, QVector3D &point) const;
     int pickObject(const QPointF &position) const;
 
     QVector<float> m_model_cpu;
@@ -101,20 +109,36 @@ private:
     QOpenGLBuffer m_gizmo_vbo{QOpenGLBuffer::VertexBuffer};
     QPointF m_last_mouse;
     QPointF m_press_mouse;
+    QPointF m_gizmo_screen_center;
     QVector2D m_pan;
     QVector2D m_layer_pan;
     float m_yaw = -35.0f;
-    float m_pitch = 58.0f;
+    float m_pitch = 32.0f;
     float m_zoom = 1.0f;
     float m_layer_zoom = 1.0f;
     bool m_layer_mode = false;
     bool m_show_model = true;
     bool m_show_supports = true;
     bool m_dragging_object = false;
+    bool m_drag_unproject_valid = false;
+    bool m_rotation_z_only = false;
     bool m_moved = false;
     int m_pressed_object = -1;
     int m_layer = 0;
+    QMatrix4x4 m_drag_inverse_mvp;
+    QVector3D m_drag_plane_point;
+    QVector3D m_drag_plane_normal;
+    QVector3D m_drag_start_world;
+    QVector3D m_drag_emitted_move;
+    QVector3D m_drag_rotation_axis{0.0f, 0.0f, 1.0f};
+    float m_drag_last_angle = 0.0f;
+    float m_drag_angle_total = 0.0f;
+    float m_drag_emitted_angle = 0.0f;
+    float m_drag_start_radius = 0.0f;
+    int m_drag_emitted_scale_steps = 0;
+    int m_minimum_selected_scale = 1;
     GizmoMode m_gizmo_mode = GizmoMode::Move;
     SelectionHandler m_selection_handler;
     TransformHandler m_transform_handler;
+    TransformFinishedHandler m_transform_finished_handler;
 };

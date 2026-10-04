@@ -22,9 +22,15 @@ int main(int argc, char *argv[]) {
     QStringList initial_files;
     const QStringList arguments = application.arguments();
     bool smoke_import = false;
+    bool smoke_history = false;
     for (int index = 1; index < arguments.size(); ++index) {
         if (arguments[index] == "--smoke-import") {
             smoke_import = true;
+            continue;
+        }
+        if (arguments[index] == "--smoke-history") {
+            smoke_import = true;
+            smoke_history = true;
             continue;
         }
         initial_files.append(QFileInfo(arguments[index]).absoluteFilePath());
@@ -41,6 +47,14 @@ int main(int argc, char *argv[]) {
         }
         qInfo().noquote()
             << QString("Import smoke test passed: %1 object(s).").arg(expected);
+        if (smoke_history) {
+            QString error;
+            if (!window.runHistorySmokeTest(error)) {
+                qCritical().noquote() << "History smoke test failed:" << error;
+                return 3;
+            }
+            qInfo().noquote() << "History smoke test passed: transform and setting undo/redo.";
+        }
         return 0;
     }
     window.show();
