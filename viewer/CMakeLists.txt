@@ -20,5 +20,9 @@ target_link_libraries(anycubic-viewer PRIVATE
     Qt6::OpenGL
     Qt6::OpenGLWidgets)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(anycubic-viewer PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 set_target_properties(anycubic-viewer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../target/release")

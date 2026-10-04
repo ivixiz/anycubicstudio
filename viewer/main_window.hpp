@@ -153,7 +153,6 @@ private:
     QDoubleSpinBox *m_pcb_exposure = nullptr;
     QComboBox *m_pcb_drill_mode = nullptr;
     QCheckBox *m_pcb_invert = nullptr;
-    QCheckBox *m_pcb_auto_mirror = nullptr;
     QDoubleSpinBox *m_pcb_invert_margin = nullptr;
     QDoubleSpinBox *m_pcb_simplify = nullptr;
     QLabel *m_pcb_status = nullptr;

@@ -649,8 +649,11 @@ void MainWindow::loadSettings() {
     m_default_pcb.auto_mirror = settings.value("pcb/autoMirror", true).toBool();
     m_default_pcb.invert_margin = settings.value("pcb/invertMargin", 0.0).toDouble();
     m_default_pcb.simplify = settings.value("pcb/simplify", 0.012).toDouble();
+    const QString environment_config = qEnvironmentVariable("ANYCUBIC_CONFIG").trimmed();
+    if (!environment_config.isEmpty())
+        m_cloud_config->setText(environment_config);
     const QString configured = settings.value("cloud/configPath").toString();
-    if (!configured.isEmpty())
+    if (m_cloud_config->text().isEmpty() && !configured.isEmpty())
         m_cloud_config->setText(configured);
     if (m_cloud_config->text().isEmpty()) {
         for (const QString &candidate : {

@@ -32,7 +32,7 @@ The project supports two independent communication paths:
 | Automatic/manual vertical supports   | Light/medium/heavy presets, three pillar shapes, CLI/JSON/Rust/C configuration             |
 | PWSZ rendered previews               | Three real software-rendered views: 224×168, 336×252, and 800×600                          |
 | Graphical plate editor               | Qt 6/OpenGL multi-model GUI: drag/drop, selection, transform/mirror/layout, supports and M7 Pro build volume |
-| GUI slicing and printer workflow     | 3D slice/upload/start and PCB slice/upload with a separate guarded start; status, pause/resume/stop through the Rust CLI |
+| GUI slicing and printer workflow     | Unified mesh/Gerber/DRL scene; explicit Slice then Run; status, pause/resume/stop through the Rust CLI |
 | Gerber + Excellon PCB exposure       | Native M7-resolution composition, exact LCD preview and Cloud-parseable one-layer PWSZ; a normal start was observed to move Z |
 | Built-in LCD service exposure        | Order 301/302 and firmware patterns 1/2/4 implemented; cannot display a caller-provided Gerber bitmap |
 | `libanycubicstudio.so` C ABI         | Builds and exports configuration, slicing, and explicit manual-support functions           |
@@ -42,8 +42,8 @@ During a live test, the original `example.pwsz` was uploaded, parsed by the
 Cloud, started, and cancelled after 64 seconds. A newly generated PCB PWSZ was
 also accepted by the Cloud. Starting that one-layer file through the normal
 print path caused platform/Z preparation despite zero configured lift, so it
-was cancelled. This is why the GUI no longer starts PCB jobs immediately after
-upload.
+was cancelled. The GUI therefore shows a platform-removal warning before Run
+starts a PCB-only job.
 
 ## Requirements
 
@@ -77,10 +77,10 @@ cmake --build viewer/build --parallel
 target/release/anycubicstudio gui
 ```
 
-Models may also be supplied at startup:
+Objects may also be supplied together at startup:
 
 ```bash
-target/release/anycubicstudio gui model.stl enclosure.step parts.3mf
+target/release/anycubicstudio gui model.stl enclosure.step board-F_Cu.gbr board-PTH.drl
 ```
 
 `ANYCUBICSTUDIO_CLI=/absolute/path/to/anycubicstudio` can be set when the Qt
@@ -89,78 +89,102 @@ never reimplements slicing or Cloud packets in C++: it invokes the Rust
 executable directly with `QProcess`, without a command shell. The bottom
 `Rust API output` dock shows the exact operation and its result.
 
-Viewer preferences persist through Qt `QSettings`. Window layout, view mode,
-printing zone, exposure/motion values, PCB composition values, the last
-applied support defaults, account-config path, printer ID, and built-in LCD
-test values are restored on the next launch. The exact settings-file path is
-printed in `Rust API output`. Account tokens remain only in the selected
-`global_config.ini`; QSettings stores its path, never its contents. Imported
-models, PWSZ paths and Cloud file IDs are deliberately not restored, preventing
-a stale job from being started after reopening the program.
+Viewer preferences persist through Qt `QSettings`: window/view state, printing
+zone, exposure/motion values, PCB and support defaults, account-config path,
+printer ID, and built-in LCD-test values. Account tokens remain only in the
+selected `global_config.ini`; QSettings stores its path, never its contents.
+Imported objects, PWSZ paths and Cloud file IDs are deliberately not restored,
+preventing a stale job from being started after reopening.
 
 When the saved account config exists, the viewer performs a read-only
-`cloud-status-detail` connection at startup and retains the detected printer
+`cloud-status` connection at startup and retains the detected printer
 ID. `Connect / detect printer` repeats it manually. If no config path has been
 saved, a `global_config.ini` in the working/project directory is used as a
 convenience fallback.
 
+### Unified scene architecture
+
+All supported inputs follow one pipeline:
+
+```text
+source file
+  → type-specific importer (CAD/STL/3MF or Gerber/Excellon)
+  → SceneObject { source_type, transform, visibility, supports, pcb }
+  → one PreparedScene layer stream
+  → ACV sliced preview and PWSZ writer
+```
+
+The Qt side owns one `std::vector<SceneObject>` and one `Models on plate`
+list—there are no parallel Gerber and mesh collections. The serialized Rust
+`SceneProject.objects` array uses the same `model`, `gerber`, and `drill`
+types. Support fields are consumed only by mesh objects and PCB fields only by
+Gerber/DRL objects.
+
+Gerber and Excellon sources retain one common KiCad coordinate frame before
+their independent transforms, so drill alignment is preserved. Their contours
+and mesh/support contours are merged into the same final layer stream. PCB Z
+translation chooses its target layer. A PCB-only scene uses its common PCB
+exposure value and zero requested lift; a mixed scene uses the global print
+profile because one physical LCD layer cannot have two exposure durations.
+
 ### Plate workflow
 
-1. Press the single `Import…` action, pass files on the command line, or drag
-   them into the window. It accepts STL, mesh-3MF, STEP/STP, IGES/IGS, Gerber
-   and Excellon DRL. The GUI classifies the input and selects the 3D or PCB
-   pipeline automatically. CAD formats use Gmsh exactly as the headless Rust
-   API does.
-2. Select a model in `Models on plate`. The selected model is orange; other
-   models are teal and supports are blue.
-3. In `Transform`, configure Move, Rotate, positive scale magnitude, and the
-   independent X/Y/Z Mirror switches, then press `Apply transform`. `Center
-   X/Y`, `Place on bed`, and `Reset transform` are shortcuts. Mirror is encoded
-   as a signed scale in the Rust project and triangle winding is corrected.
+1. Press `Import…`, pass paths on the command line, or drag any mixture of STL,
+   mesh-3MF, STEP/STP, IGES/IGS, Gerber, and Excellon DRL into the window. All
+   inputs appear in `Models on plate` and the same 3D scene. CAD uses native
+   OpenCascade when available and Gmsh otherwise.
+2. Click an object in the list or directly in the 3D view. Ctrl/Shift-click
+   toggles multi-selection; selected objects are orange. Press `Delete` to
+   remove the selection. There is intentionally no Remove toolbar button.
+3. Choose Move, Rotate, or Scale in the toolbar and drag a selected object.
+   The coloured gizmo and numeric fields update live. Numeric Move/Rotate/
+   Scale/Mirror edits also apply live; there is no `Apply transform` button.
+   PCB objects use Z rotation and uniform XY scale. `Center X/Y`, `Place on
+   bed`, and `Reset transform` remain shortcuts.
 4. `Auto layout` places the centres of imported objects on non-overlapping
    shelf rows with a 5 mm margin. It refuses the operation if the current
    bounds do not fit the configured plate. It is a deterministic basic layout,
    not yet a polygon nesting optimiser.
-5. Configure supports for the selected object on the `Supports` tab. None,
+5. Configure supports for selected 3D objects on the `Supports` tab. None,
    Light, Medium, and Heavy presets fill the editable shape, overhang angle,
    spacing, contact, trunk, base, height, penetration, and radial-segment
    fields. `Automatic placement` can be disabled for manual
-   `X,Y,Z[,BASE_Z]` contact points. Press `Apply supports and rebuild` to ask
-   the Rust engine for a new preview.
+   `X,Y,Z[,BASE_Z]` contact points. Supports are object state: Slice generates
+   them automatically and returns the generated geometry to the 3D view.
 6. In `Print & zone`, configure the build volume, layer/exposure and lift
    values. The default volume is the recovered Photon Mono M7 Pro profile:
    **223.642 × 126.480 × 230 mm**, 13312 × 5120 pixels. The bed grid and the
    complete three-dimensional volume outline are rendered in the 3D view.
-7. Configure `Printer/Cloud`. For 3D input, `Slice & Run…` writes the PWSZ,
-   uploads it and asks for final confirmation before starting. For Gerber/DRL,
-   the same action is renamed `Slice & Upload…`; it writes and uploads the
-   one-layer PWSZ but deliberately does not start it. After physically removing
-   the platform, use the separate guarded PCB start button. After slicing,
-   `Sliced layer` displays the exact contours.
-
-3D models and PCB artwork cannot be combined in one print job: a resin model
-has many height layers, while a PCB exposure deliberately has one stationary
-layer. If both types are loaded, `Slice & Run…` fails closed and asks the user
-to remove one type instead of silently choosing one.
+7. The right tabs follow selection. Model-only selection shows Supports;
+   PCB-only selection shows PCB settings; mixed selection shows both. Each edit
+   is applied only to compatible selected objects.
+8. Press `Slice`. It creates the local PWSZ, generates supports, exports the
+   exact common layer preview, switches to `Sliced layers`, and enables Run.
+9. Inspect layers with the slider. Wheel zooms, dragging pans, and `Fit view`
+   restores aspect-correct fit.
+10. Press `Run` to upload the already prepared PWSZ and, after confirmation,
+    start it. Run never invokes Slice implicitly.
 
 Camera controls in 3D mode:
 
 | Input | Action |
 | --- | --- |
-| left drag | orbit |
+| click object / empty space | select object / clear selection |
+| Ctrl/Shift + click | toggle multi-selection |
+| left drag selected object | active Move/Rotate/Scale gizmo |
+| left drag empty space | orbit |
 | Shift + left drag | pan |
 | middle or right drag | pan |
 | mouse wheel | zoom |
-| `Reset camera` | reset orbit, zoom, and pan |
+| `Fit view` | reset camera or fit current 2D layer |
 
 Switching between `Sliced layer` and `3D model & supports` explicitly restores
 the OpenGL depth state. Front surfaces therefore remain opaque instead of
 showing rear/internal faces after the `QPainter` layer view has been used.
 
 Any geometry, support, printing-zone, or exposure change invalidates the
-previous PWSZ and its Cloud file ID. `Slice & Run…`/`Slice & Upload…` always
-rebuilds the job before upload, preventing a stale file from being printed by
-mistake.
+previous PWSZ and Cloud file ID and disables Run. This makes a stale file
+impossible to start without an explicit new Slice.
 
 ### GUI Cloud workflow
 
@@ -169,13 +193,12 @@ numeric Cloud printer ID returned by `cloud-status`. You may set
 `ANYCUBIC_CONFIG` to prefill the configuration path. The file path is logged,
 but its token contents are never displayed by the GUI.
 
-The primary GUI action is deliberately unified:
+The GUI workflow is deliberately explicit:
 
 | GUI action | Rust command | Effect |
 | --- | --- | --- |
-| `Slice & Run…` with 3D input | `project-slice` → `cloud-upload` → `cloud-start` | Rebuild, upload and start after confirmation |
-| `Slice & Upload…` with Gerber/DRL | `pcb-slice` → `cloud-upload` | Create and deliver a one-layer job without moving the printer |
-| `Start uploaded PCB (platform removed)…` | `cloud-start-pcb` | Start the last uploaded PCB with all confirmed editable preparation flags disabled |
+| `Slice…` | `project-slice` + `project-viewer-scene` | Build local PWSZ and exact preview; no network/printer action |
+| `Run…` | `cloud-upload` → `cloud-start` or `cloud-start-pcb` | Upload the existing prepared PWSZ and start after confirmation; never re-slice |
 | `Run built-in LCD test…` / `STOP LCD test` | `cloud-exposure-start` / `cloud-exposure-stop` | Motion-free firmware test pattern; not the imported Gerber image |
 | `Printer status` | `cloud-status-detail <CONFIG>` | Read-only Cloud state |
 | `Pause` / `Resume` | `cloud-pause` / `cloud-resume` | Resolves one active project safely, then controls it |
@@ -188,13 +211,11 @@ Cloud file but does not send a start command. Pause/resume/stop use the
 fail-closed active-project resolver described below. Closing a progress dialog
 terminates the local Rust subprocess; after a network interruption, always
 read printer status before repeating an active operation. For local-only PWSZ
-creation without upload/start, use the explicit `slice`, `project-slice`, or
-`pcb-slice` CLI command.
-
-The GUI currently provides numeric transforms rather than an on-model gizmo,
-and manual support contacts are entered as coordinates rather than picked with
-a ray cast. Support geometry is the independent vertical-pillar engine
-documented below, not Workshop/VoxSDK tree support parity.
+creation without upload/start, press Slice and stop there, or use the explicit
+`slice`, `project-slice`, or `pcb-slice` CLI command. Manual support contacts
+are still coordinate-based, and support geometry is the independent
+vertical-pillar engine documented below, not Workshop/VoxSDK tree-support
+parity.
 
 ## PCB photoresist exposure from KiCad Gerber and drill files
 
@@ -353,33 +374,31 @@ options override it; `--save-config` writes the final effective settings.
 
 ### PCB workflow in the GUI
 
-Use the same top `Import…` action as for STEP/STL/3MF, or drag all KiCad `.gbr`
-and `.drl` files into the main window together. The PCB tab labels Gerber and
-drill inputs separately and contains only PCB-specific parameters. Configure
-exposure, drill mode, polarity, mirroring, rotation, scale and XY offset, then
-press `Preview exact LCD layer`. In `Sliced layer`, cyan is UV-on and dark is
-masked.
+Use the same top `Import…` action as for STEP/STL/3MF, or drag KiCad `.gbr` and
+`.drl` files into the window. Every source becomes an independently selectable
+row in `Models on plate`; its physical contour is also visible and pickable in
+the 3D view. Move, Z rotation, uniform XY scale, X/Y mirror, multi-selection,
+layout and `Delete` use the common scene controls.
 
-The `Mirror layers (X)` checkbox maps to Rust's `--mirror-layers` option.
-`Auto from KiCad F_* filename` is enabled by default and recalculates that
-checkbox whenever files are added or removed: `F_Cu`, `F_Mask`, `F_Paste`, or
-`F_Silkscreen` enables it, while a new back-only set does not inherit a stale
-front-side mirror. Disable Auto to keep a fully manual orientation. Both
-controls are saved when the viewer closes.
+When only Gerber/DRL-compatible objects are selected, the PCB tab exposes
+exposure, drill composition, polarity, invert margin and contour simplification.
+The common Transform tab owns mirror, rotate and move. Importing a filename
+containing `F_Cu`, `F_Mask`, `F_Paste`, or `F_Silkscreen` makes the effective X
+mirror active automatically; editing a mirror checkbox turns that into an
+explicit per-object transform. The choice is stored with the scene object.
 
-With only PCB files loaded, the top action reads `Slice & Upload…`. It creates
-the one-layer PWSZ, waits for successful Cloud parsing and delivers the file,
-then stops without issuing a print order. The PCB tab exposes a separate
-`Start uploaded PCB (platform removed)…` button. It uses `cloud-start-pcb` and
-shows an explicit platform-removal/homing warning. Printer status, pause,
-resume and safe active-project stop use the same Rust Cloud API as resin jobs.
+Press `Slice` to compose the exact UV layer. The viewer switches to `Sliced
+layers`, where cyan is UV-on and dark is masked. Press `Run` only after that
+preview has been checked. It uploads this already prepared PWSZ and uses the
+guarded PCB start path for a PCB-only scene; there is no separate PCB start or
+preview workflow. Printer status, pause, resume and safe active-project stop
+use the same Rust Cloud API as resin jobs.
 
 Before an actual exposure:
 
 1. inspect the complete layer for scale, polarity, clipped geometry, holes and
    mirror direction;
-2. validate the PWSZ locally; `Slice & Upload…` can test transfer without
-   sending any print/start command;
+2. validate the PWSZ locally; `Slice` never uploads or starts it;
 3. read printer status and require idle state;
 4. remove the build platform before starting an arbitrary Gerber PWSZ, verify
    all remaining clearance, close the UV cover and prevent direct eye/skin
@@ -1026,9 +1045,9 @@ After sending a control command, run `cloud-projects` again and monitor the stat
 | `slicer-default-config <JSON>`                    | Write the complete default slicer configuration | Local file creation    |
 | `viewer <MODEL> [SLICE_OPTIONS]`                  | Generate a temporary scene and inspect it        | Local GUI/read-only    |
 | `viewer-scene <MODEL> <ACV> [SLICE_OPTIONS]`      | Export the internal viewer scene without a GUI   | Local file creation    |
-| `gui [MODEL ...]`                                 | Open the multi-model plate editor and controls   | Local GUI; buttons may invoke Cloud |
-| `project-viewer-scene <JSON> <ACV>`               | Export a multi-model inspection scene            | Local file creation    |
-| `project-slice <JSON> <PWSZ>`                     | Slice a serialized multi-model plate             | Local file creation    |
+| `gui [OBJECT ...]`                                | Open the unified model/PCB plate editor          | Local GUI; buttons may invoke Cloud |
+| `project-viewer-scene <JSON> <ACV>`               | Export a unified scene for inspection             | Local file creation    |
+| `project-slice <JSON> <PWSZ>`                     | Slice a serialized model/PCB scene                | Local file creation    |
 | `pcb-default-config <JSON>`                       | Write the default PCB exposure configuration      | Local file creation    |
 | `pcb-viewer-scene <GERBER> <ACV> [PCB_OPTIONS]`   | Compose Gerber/DRL and export exact LCD preview    | Local file creation    |
 | `pcb-slice <GERBER> <PWSZ> [PCB_OPTIONS]`         | Create a one-layer PCB photoresist exposure job    | Local file creation    |
@@ -1279,8 +1298,9 @@ src/
 ├── upload.rs     direct LAN HTTP upload
 ├── pwsz.rs       PWSZ metadata and vector-layer parser
 ├── slicer/
-│   ├── mesh.rs          STL/3MF readers, CAD conversion, transforms
+│   ├── mesh.rs          STL/3MF readers, native OCCT/Gmsh CAD import, transforms
 │   ├── geometry.rs      plane intersections, contours, layer merging
+│   ├── pcb.rs           Gerber/Excellon parsing and unified artwork objects
 │   ├── support.rs       automatic/manual vertical supports
 │   ├── render.rs        software-rendered PWSZ previews
 │   ├── viewer_scene.rs  compact viewer interchange file
@@ -1292,7 +1312,7 @@ src/
 viewer/
 ├── CMakeLists.txt
 ├── main.cpp         application startup
-├── main_window.*    multi-model editor, slicer and Cloud workflow
+├── main_window.*    unified scene editor, slicer and Cloud workflow
 ├── print_view.*     OpenGL model/support/build-volume and layer renderer
 └── scene.*          internal `.acv` scene parser and GUI project state
 
