@@ -3,7 +3,6 @@
 #include "scene.hpp"
 
 #include <QMainWindow>
-#include <QVector3D>
 
 #include <memory>
 #include <optional>
@@ -17,13 +16,15 @@ class QComboBox;
 class QDoubleSpinBox;
 class QDragEnterEvent;
 class QDropEvent;
+class QKeyEvent;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
-class QPushButton;
 class QSlider;
 class QSpinBox;
+class QTabWidget;
+class QTimer;
 class PrintView;
 
 class MainWindow final : public QMainWindow {
@@ -34,14 +35,15 @@ protected:
     void closeEvent(QCloseEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
+    void keyPressEvent(QKeyEvent *event) override;
 
 private:
     void buildInterface();
     QWidget *buildCentre();
     QWidget *buildTransformPanel();
     QWidget *buildSupportPanel();
-    QWidget *buildPrintPanel();
     QWidget *buildPcbPanel();
+    QWidget *buildPrintPanel();
     QWidget *buildCloudPanel();
     void connectActions();
     void loadSettings();
@@ -49,66 +51,76 @@ private:
 
     void importDialog();
     void importPaths(const QStringList &paths);
-    void importPcbPaths(const QStringList &paths);
-    void updatePcbAutoMirror();
-    void removeSelectedPcbFile();
-    void refreshPcbFiles();
-    bool previewPcb();
-    bool slicePcb();
     bool importPath(const QString &path);
-    void removeSelected();
-    void selectModel(int row);
-    ModelState *selectedModel();
-    const ModelState *selectedModel() const;
-    void refreshModelList();
-    void refreshView();
-    void loadModelControls();
-    void applyTransform();
-    void resetTransform();
-    void centreSelected();
-    void placeSelectedOnBed();
+    void deleteSelection();
     void autoLayout();
-    void applySupports();
+    void selectionFromList();
+    void selectionFromView(int index, Qt::KeyboardModifiers modifiers);
+    std::vector<SceneObject *> selectedObjects();
+    std::vector<const SceneObject *> selectedObjects() const;
+    SceneObject *firstSelectedModel();
+    SceneObject *firstSelectedArtwork();
+    void refreshObjectList();
+    void refreshView();
+    void refreshPropertyPanels();
+    void loadTransformControls();
+    void loadSupportControls();
+    void loadPcbControls();
+    void applyTransformLive();
+    void applySupportsLive();
+    void applyPcbLive();
+    void resetTransform();
+    void centreSelection();
+    void placeSelectionOnBed();
     void applySupportPreset(int index);
     void addManualSupport();
     void removeManualSupport();
     void refreshManualSupports();
-    bool rebuildModel(ModelState &model, bool show_error = true);
+    void gizmoTransform(int mode, const QVector3D &delta);
+    void transformVisual(SceneObject &object, int mode, const QVector3D &delta);
+    void scheduleRebuild();
+    void rebuildSelectedPreviews();
+    bool rebuildObject(SceneObject &object, bool show_error = true);
 
     void updateLayerControls();
     void updateLayerLabel(int layer);
     void printingZoneChanged();
     void invalidateSlice();
     void updateActions();
+    bool sliceScene();
+    void runPrepared();
+    bool uploadToCloud();
+    void startPrinting();
+
     void browseCloudConfig();
     void loginToCloud();
     bool connectToCloud(bool show_result);
-    bool sliceProject();
-    void sliceAndRun();
-    bool uploadToCloud();
-    void startPrinting();
+    bool validateCloudInputs(qulonglong &printer_id);
     void pausePrinting();
     void resumePrinting();
     void stopPrinting();
+    void requestPrinterStatus();
     void startBuiltinExposure();
     void stopBuiltinExposure();
-    void requestPrinterStatus();
 
     ProcessResult runRust(const QStringList &arguments, const QString &title,
                           int timeout_ms = 15 * 60 * 1000,
                           const QByteArray &standard_input = {});
     QString rustCli() const;
-    QStringList modelArguments(const ModelState &model, const QString &operation,
-                               const QString &output) const;
-    QStringList pcbArguments(const QString &operation, const QString &output) const;
-    QByteArray projectJson() const;
+    QByteArray projectJson(const SceneObject *isolated = nullptr,
+                           bool expose_isolated_drill = false) const;
     QString makeTemporaryPath(const QString &suffix) const;
-    bool writeTemporaryProject(QString &path, QString &error) const;
-    bool validateCloudInputs(qulonglong &printer_id);
+    bool writeTemporaryProject(QString &path, QString &error,
+                               const SceneObject *isolated = nullptr,
+                               bool expose_isolated_drill = false) const;
     void appendLog(const QString &text);
 
     PrintView *m_view = nullptr;
-    QListWidget *m_model_list = nullptr;
+    QListWidget *m_object_list = nullptr;
+    QTabWidget *m_tabs = nullptr;
+    QWidget *m_transform_panel = nullptr;
+    QWidget *m_support_panel = nullptr;
+    QWidget *m_pcb_panel = nullptr;
     QComboBox *m_view_mode = nullptr;
     QCheckBox *m_show_model = nullptr;
     QCheckBox *m_show_supports = nullptr;
@@ -138,6 +150,14 @@ private:
     QSpinBox *m_support_segments = nullptr;
     QListWidget *m_manual_supports = nullptr;
 
+    QDoubleSpinBox *m_pcb_exposure = nullptr;
+    QComboBox *m_pcb_drill_mode = nullptr;
+    QCheckBox *m_pcb_invert = nullptr;
+    QCheckBox *m_pcb_auto_mirror = nullptr;
+    QDoubleSpinBox *m_pcb_invert_margin = nullptr;
+    QDoubleSpinBox *m_pcb_simplify = nullptr;
+    QLabel *m_pcb_status = nullptr;
+
     QDoubleSpinBox *m_zone[3]{};
     QDoubleSpinBox *m_layer_height = nullptr;
     QSpinBox *m_bottom_layers = nullptr;
@@ -154,37 +174,23 @@ private:
     QComboBox *m_exposure_pattern = nullptr;
     QSpinBox *m_exposure_duration = nullptr;
 
-    QListWidget *m_pcb_files = nullptr;
-    QDoubleSpinBox *m_pcb_exposure = nullptr;
-    QComboBox *m_pcb_drill_mode = nullptr;
-    QCheckBox *m_pcb_invert = nullptr;
-    QCheckBox *m_pcb_auto_mirror = nullptr;
-    QCheckBox *m_pcb_mirror_x = nullptr;
-    QCheckBox *m_pcb_mirror_y = nullptr;
-    QDoubleSpinBox *m_pcb_rotate = nullptr;
-    QDoubleSpinBox *m_pcb_scale = nullptr;
-    QDoubleSpinBox *m_pcb_move[2]{};
-    QDoubleSpinBox *m_pcb_invert_margin = nullptr;
-    QDoubleSpinBox *m_pcb_simplify = nullptr;
-    QDoubleSpinBox *m_pcb_lift_height = nullptr;
-    QLabel *m_pcb_status = nullptr;
-
-    QAction *m_remove_action = nullptr;
     QAction *m_layout_action = nullptr;
     QAction *m_slice_action = nullptr;
+    QAction *m_run_action = nullptr;
     QAction *m_pause_action = nullptr;
     QAction *m_resume_action = nullptr;
     QAction *m_stop_action = nullptr;
     QAction *m_status_action = nullptr;
+    QTimer *m_rebuild_timer = nullptr;
 
-    std::vector<std::unique_ptr<ModelState>> m_models;
+    std::vector<std::unique_ptr<SceneObject>> m_objects;
     SupportSettings m_default_supports;
-    QStringList m_pcb_gerbers;
-    QStringList m_pcb_drills;
+    PcbSettings m_default_pcb;
     QVector<LayerData> m_sliced_layers;
     QString m_last_pwsz;
     std::optional<qulonglong> m_cloud_file_id;
     bool m_last_job_is_pcb = false;
     double m_last_pcb_exposure = 0.0;
     bool m_loading_controls = false;
+    quint64 m_next_object_id = 1;
 };

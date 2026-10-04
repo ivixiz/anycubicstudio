@@ -50,9 +50,24 @@ struct SupportSettings {
     std::vector<ManualSupport> manual;
 };
 
-struct ModelState {
+enum class SceneObjectType { Model, Gerber, Drill, ViewerScene };
+
+struct PcbSettings {
+    double exposure = 60.0;
+    QString drill_mode = "clear";
+    bool invert = false;
+    bool auto_mirror = true;
+    double invert_margin = 0.0;
+    double simplify = 0.012;
+};
+
+struct SceneObject {
+    quint64 id = 0;
+    SceneObjectType type = SceneObjectType::Model;
     QString path;
     QString display_name;
+    bool visible = true;
+    bool selected = false;
     QVector3D move{0.0f, 0.0f, 0.0f};
     QVector3D rotate{0.0f, 0.0f, 0.0f};
     QVector3D scale{1.0f, 1.0f, 1.0f};
@@ -61,7 +76,13 @@ struct ModelState {
     bool mirror_z = false;
     bool editable = true;
     SupportSettings supports;
+    PcbSettings pcb;
     SceneData visual;
+
+    bool isModel() const { return type == SceneObjectType::Model; }
+    bool isArtwork() const {
+        return type == SceneObjectType::Gerber || type == SceneObjectType::Drill;
+    }
 };
 
 struct ProcessResult {

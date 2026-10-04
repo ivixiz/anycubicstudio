@@ -130,6 +130,13 @@ bool loadScene(const QString &path, SceneData &scene, QString &error) {
                 float x, y;
                 stream >> x >> y;
                 contour.append(QVector2D(x, y));
+                has_point = true;
+                minimum.setX(std::min(minimum.x(), x));
+                minimum.setY(std::min(minimum.y(), y));
+                minimum.setZ(std::min(minimum.z(), layer.z));
+                maximum.setX(std::max(maximum.x(), x));
+                maximum.setY(std::max(maximum.y(), y));
+                maximum.setZ(std::max(maximum.z(), layer.z + 0.05f));
             }
             layer.contours.append(std::move(contour));
         }
@@ -138,6 +145,10 @@ bool loadScene(const QString &path, SceneData &scene, QString &error) {
     if (stream.status() != QDataStream::Ok) {
         error = "Viewer scene is truncated";
         return false;
+    }
+    if (has_point) {
+        scene.minimum = minimum;
+        scene.maximum = maximum;
     }
     return true;
 }
