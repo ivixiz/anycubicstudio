@@ -27,6 +27,7 @@ dependencies = [
  "anyhow",
  "base64",
  "cbc",
+ "cc",
  "crc32fast",
  "flate2",
  "futures-util",

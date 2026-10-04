@@ -404,19 +404,50 @@ fn prepare_project(project: &SceneProject) -> Result<PreparedScene> {
         triangles: Vec::new(),
     };
     let mut support_count = 0;
+    let tessellation_error = tessellation_error_mm(&project.config);
+    let stitch_tolerance = contour_tolerance_mm(&project.config);
+    let topology_verified_cad = cfg!(anycubic_occt)
+        && project.models.iter().all(|model| {
+            model
+                .input
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "step" | "stp" | "iges" | "igs"
+                    )
+                })
+        });
+    // Preserve CAD surface shape here. Broad contour healing belongs to the
+    // 2D graph, while 3D welding is only for numerically coincident vertices.
+    let weld_tolerance = (tessellation_error * 0.01).max(1.0e-7);
     for instance in &project.models {
         let mut instance_config = project.config.clone();
         instance_config.transform = instance.transform.clone();
         instance_config.supports = instance.supports.clone();
         validate_config(&instance_config)?;
-        let mut instance_mesh = Mesh::load(&instance.input, &instance_config.gmsh_path)?;
+        let mut instance_mesh = Mesh::load(
+            &instance.input,
+            &instance_config.gmsh_path,
+            tessellation_error,
+        )?;
         instance_mesh.apply_transform(&instance_config.transform)?;
+        instance_mesh.repair_for_slicing(weld_tolerance)?;
         let generated = generate_supports(&instance_mesh, &instance_config.supports)?;
         support_count += generated.count;
         model.triangles.extend(instance_mesh.triangles);
         supports.triangles.extend(generated.mesh.triangles);
     }
-    prepare_loaded_scene(model, supports, support_count, &project.config)
+    prepare_loaded_scene(
+        model,
+        supports,
+        support_count,
+        &project.config,
+        stitch_tolerance,
+        tessellation_error,
+        topology_verified_cad,
+    )
 }
 
 fn prepare_loaded_scene(
@@ -424,6 +455,9 @@ fn prepare_loaded_scene(
     supports: Mesh,
     support_count: usize,
     config: &SlicerConfig,
+    stitch_tolerance: f64,
+    tessellation_error: f64,
+    topology_verified_cad: bool,
 ) -> Result<PreparedScene> {
     let mut mesh = model.clone();
     mesh.triangles.extend_from_slice(&supports.triangles);
@@ -433,10 +467,24 @@ fn prepare_loaded_scene(
         maximum.y - minimum.y,
         maximum.z - minimum.z,
     ];
+    let generic_gap = stitch_tolerance * 5.0;
+    // On a topologically closed B-Rep, neighbouring faces can sample their
+    // common curved edge at different parametric positions. The along-edge
+    // separation can approach a whole tessellation chord even though both
+    // faces stay within the requested sub-pixel chordal error. Only models
+    // explicitly validated as closed by OCCT receive this larger limit.
+    let diagonal = (size[0].powi(2) + size[1].powi(2) + size[2].powi(2)).sqrt();
+    let model_gap = if topology_verified_cad {
+        (8.0 * diagonal * tessellation_error)
+            .sqrt()
+            .clamp(generic_gap, 3.0)
+    } else {
+        generic_gap
+    };
     if size
         .iter()
         .zip(config.machine.build_volume_mm)
-        .any(|(model, build)| *model > build + 1.0e-6)
+        .any(|(model, build)| *model > build + stitch_tolerance)
     {
         return Err(Error::InvalidModel(format!(
             "transformed model size {:.3} x {:.3} x {:.3} mm exceeds build volume {:.3} x {:.3} x {:.3} mm",
@@ -450,12 +498,12 @@ fn prepare_loaded_scene(
     }
     let half_x = config.machine.build_volume_mm[0] * 0.5;
     let half_y = config.machine.build_volume_mm[1] * 0.5;
-    if minimum.x < -half_x - 1.0e-6
-        || maximum.x > half_x + 1.0e-6
-        || minimum.y < -half_y - 1.0e-6
-        || maximum.y > half_y + 1.0e-6
-        || minimum.z < -1.0e-6
-        || maximum.z > config.machine.build_volume_mm[2] + 1.0e-6
+    if minimum.x < -half_x - stitch_tolerance
+        || maximum.x > half_x + stitch_tolerance
+        || minimum.y < -half_y - stitch_tolerance
+        || maximum.y > half_y + stitch_tolerance
+        || minimum.z < -stitch_tolerance
+        || maximum.z > config.machine.build_volume_mm[2] + stitch_tolerance
     {
         return Err(Error::InvalidModel(format!(
             "transformed model bounds [{:.3}, {:.3}] x [{:.3}, {:.3}] x [{:.3}, {:.3}] mm lie outside the centered build volume",
@@ -463,10 +511,25 @@ fn prepare_loaded_scene(
         )));
     }
     let layers = if supports.triangles.is_empty() {
-        slice_mesh(&model, config.print.layer_height_mm)?
+        slice_mesh(
+            &model,
+            config.print.layer_height_mm,
+            stitch_tolerance,
+            model_gap,
+        )?
     } else {
-        let model_layers = slice_mesh(&model, config.print.layer_height_mm)?;
-        let support_layers = slice_mesh(&supports, config.print.layer_height_mm)?;
+        let model_layers = slice_mesh(
+            &model,
+            config.print.layer_height_mm,
+            stitch_tolerance,
+            model_gap,
+        )?;
+        let support_layers = slice_mesh(
+            &supports,
+            config.print.layer_height_mm,
+            stitch_tolerance,
+            generic_gap,
+        )?;
         geometry::merge_layers(&model_layers, &support_layers, config.print.layer_height_mm)
     };
     if let Some(layer) = layers
@@ -495,6 +558,34 @@ fn prepare_loaded_scene(
         ],
         volume_mm3,
     })
+}
+
+/// Surface tessellation targets half an XY pixel, capped at the printer's
+/// practical 10 µm Z resolution. This value is a chordal-error goal; Gmsh's
+/// scale- and curvature-aware edge sizing is derived from it.
+fn tessellation_error_mm(config: &SlicerConfig) -> f64 {
+    let half_xy_pixel = config
+        .machine
+        .pixel_size_um
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        / 2000.0;
+    half_xy_pixel.clamp(0.001, 0.01)
+}
+
+/// Endpoints closer than the smallest LCD pixel are physically indistinguishable
+/// on the target machine. Keeping the cap at 25 µm repairs
+/// float/tessellation cracks without silently bridging macroscopic shell gaps.
+fn contour_tolerance_mm(config: &SlicerConfig) -> f64 {
+    let xy_pixel = config
+        .machine
+        .pixel_size_um
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        / 1000.0;
+    xy_pixel.clamp(1.0e-5, 0.025)
 }
 
 fn validate_config(config: &SlicerConfig) -> Result<()> {

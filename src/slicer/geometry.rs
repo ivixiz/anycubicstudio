@@ -4,7 +4,6 @@ use crate::{Error, Result};
 
 use super::mesh::{Mesh, Triangle};
 
-const STITCH_TOLERANCE_MM: f64 = 1.0e-5;
 const MIN_SEGMENT_LENGTH_SQUARED: f64 = 1.0e-16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -36,14 +35,29 @@ impl LayerSlice {
     }
 }
 
-pub(crate) fn slice_mesh(mesh: &Mesh, layer_height: f64) -> Result<Vec<LayerSlice>> {
+pub(crate) fn slice_mesh(
+    mesh: &Mesh,
+    layer_height: f64,
+    stitch_tolerance_mm: f64,
+    maximum_gap_mm: f64,
+) -> Result<Vec<LayerSlice>> {
     if !layer_height.is_finite() || layer_height <= 0.0 {
         return Err(Error::InvalidModel(
             "layer height must be finite and greater than zero".into(),
         ));
     }
+    if !stitch_tolerance_mm.is_finite() || stitch_tolerance_mm <= 0.0 {
+        return Err(Error::InvalidModel(
+            "contour stitch tolerance must be finite and positive".into(),
+        ));
+    }
+    if !maximum_gap_mm.is_finite() || maximum_gap_mm < stitch_tolerance_mm {
+        return Err(Error::InvalidModel(
+            "maximum contour gap must be finite and at least the stitch tolerance".into(),
+        ));
+    }
     let (minimum, maximum) = mesh.bounds();
-    if minimum.z < -STITCH_TOLERANCE_MM {
+    if minimum.z < -stitch_tolerance_mm {
         return Err(Error::InvalidModel(format!(
             "model extends below the build plate ({:.6} mm)",
             minimum.z
@@ -86,13 +100,20 @@ pub(crate) fn slice_mesh(mesh: &Mesh, layer_height: f64) -> Result<Vec<LayerSlic
         .enumerate()
         .map(|(index, candidates)| {
             let z = (index as f64 + 0.5) * layer_height;
+            // A mathematical section exactly through a mesh vertex or a
+            // coplanar triangle edge is ambiguous and can omit one incident
+            // segment. Select the infinitesimally higher side consistently;
+            // this is several orders below an LCD pixel and does not relax
+            // contour validation.
+            let section_z = z + stitch_tolerance_mm * 1.0e-4;
             let raw_segments = candidates
                 .into_iter()
-                .filter_map(|triangle| intersect_triangle(mesh.triangles[triangle], z))
+                .filter_map(|triangle| intersect_triangle(mesh.triangles[triangle], section_z))
                 .collect::<Vec<_>>();
-            let mut contours = stitch_segments(&raw_segments).map_err(|message| {
-                Error::InvalidModel(format!("layer {index} at z={z:.6} mm: {message}"))
-            })?;
+            let mut contours = stitch_segments(&raw_segments, stitch_tolerance_mm, maximum_gap_mm)
+                .map_err(|message| {
+                    Error::InvalidModel(format!("layer {index} at z={z:.6} mm: {message}"))
+                })?;
             orient_contours(&mut contours);
             Ok(prepare_layer(index as u32, z, contours))
         })
@@ -156,63 +177,147 @@ fn intersect_triangle(triangle: Triangle, z: f64) -> Option<[Vec2; 2]> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct PointKey(i64, i64);
+struct GridCell(i64, i64);
 
-impl PointKey {
-    fn new(point: Vec2) -> Self {
+impl GridCell {
+    fn new(point: Vec2, tolerance: f64) -> Self {
         Self(
-            (point.x / STITCH_TOLERANCE_MM).round() as i64,
-            (point.y / STITCH_TOLERANCE_MM).round() as i64,
+            (point.x / tolerance).floor() as i64,
+            (point.y / tolerance).floor() as i64,
         )
     }
 }
 
-fn stitch_segments(segments: &[[Vec2; 2]]) -> std::result::Result<Vec<Vec<Vec2>>, String> {
-    let mut endpoints = HashMap::<PointKey, Vec<(usize, usize)>>::new();
-    for (index, segment) in segments.iter().enumerate() {
-        endpoints
-            .entry(PointKey::new(segment[0]))
-            .or_default()
-            .push((index, 0));
-        endpoints
-            .entry(PointKey::new(segment[1]))
-            .or_default()
-            .push((index, 1));
+fn stitch_segments(
+    segments: &[[Vec2; 2]],
+    tolerance: f64,
+    maximum_gap: f64,
+) -> std::result::Result<Vec<Vec<Vec2>>, String> {
+    let tolerance_squared = tolerance * tolerance;
+    let mut nodes = Vec::<Vec2>::new();
+    let mut cells = HashMap::<GridCell, Vec<usize>>::new();
+    let mut endpoint_nodes = Vec::<[usize; 2]>::with_capacity(segments.len());
+    for segment in segments {
+        let mut endpoints = [0_usize; 2];
+        for (endpoint_index, point) in segment.iter().copied().enumerate() {
+            let cell = GridCell::new(point, tolerance);
+            let mut nearest = None::<(usize, f64)>;
+            for x_offset in -1..=1 {
+                for y_offset in -1..=1 {
+                    let neighbour = GridCell(cell.0 + x_offset, cell.1 + y_offset);
+                    for node in cells.get(&neighbour).into_iter().flatten().copied() {
+                        let distance = distance_squared(nodes[node], point);
+                        if distance <= tolerance_squared
+                            && nearest.is_none_or(|(_, best)| distance < best)
+                        {
+                            nearest = Some((node, distance));
+                        }
+                    }
+                }
+            }
+            endpoints[endpoint_index] = if let Some((node, _)) = nearest {
+                node
+            } else {
+                let node = nodes.len();
+                nodes.push(point);
+                cells.entry(cell).or_default().push(node);
+                node
+            };
+        }
+        endpoint_nodes.push(endpoints);
     }
-    let mut used = vec![false; segments.len()];
+
+    // CAD faces can be tessellated independently even when they share the
+    // same topological edge. If the first resolution-sized clustering leaves
+    // nearby odd-degree endpoint pairs within the caller's source-aware limit,
+    // merge that pair explicitly. Larger holes remain fatal errors.
+    heal_odd_nodes(&mut nodes, &mut endpoint_nodes, maximum_gap);
+
+    let edges = parity_edges(&endpoint_nodes);
+    let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
+    for (edge, [first, second]) in edges.iter().copied().enumerate() {
+        adjacency[first].push(edge);
+        adjacency[second].push(edge);
+    }
+    let odd_nodes = adjacency
+        .iter()
+        .enumerate()
+        .filter_map(|(node, adjacent)| (adjacent.len() % 2 != 0).then_some(node))
+        .collect::<Vec<_>>();
+    if let Some(&node) = odd_nodes.first() {
+        let nearest = odd_nodes
+            .iter()
+            .copied()
+            .filter(|candidate| *candidate != node)
+            .map(|candidate| {
+                (
+                    candidate,
+                    distance_squared(nodes[node], nodes[candidate]).sqrt(),
+                )
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+        let nearest_text = nearest.map_or_else(
+            || "no other odd endpoint".to_owned(),
+            |(candidate, distance)| {
+                format!(
+                    "nearest odd endpoint ({:.6}, {:.6}) is {:.6} mm away",
+                    nodes[candidate].x, nodes[candidate].y, distance
+                )
+            },
+        );
+        return Err(format!(
+            "open/non-manifold contour near ({:.6}, {:.6}); {} odd nodes, node degree {} after {:.6} mm welding; {}",
+            nodes[node].x,
+            nodes[node].y,
+            odd_nodes.len(),
+            adjacency[node].len(),
+            tolerance,
+            nearest_text
+        ));
+    }
+
+    let mut used = vec![false; edges.len()];
     let mut contours = Vec::new();
-    for first_segment in 0..segments.len() {
-        if used[first_segment] {
+    for first_edge in 0..edges.len() {
+        if used[first_edge] {
             continue;
         }
-        used[first_segment] = true;
-        let start = segments[first_segment][0];
-        let mut current = segments[first_segment][1];
-        let start_key = PointKey::new(start);
-        let mut contour = vec![start, current];
-        while PointKey::new(current) != start_key {
-            let key = PointKey::new(current);
-            let next = endpoints
-                .get(&key)
-                .and_then(|candidates| {
-                    candidates
-                        .iter()
-                        .find(|(segment, _)| !used[*segment])
-                        .copied()
+        used[first_edge] = true;
+        let start = edges[first_edge][0];
+        let mut previous = start;
+        let mut current = edges[first_edge][1];
+        let mut contour = vec![nodes[start]];
+        while current != start {
+            contour.push(nodes[current]);
+            let incoming = Vec2 {
+                x: nodes[current].x - nodes[previous].x,
+                y: nodes[current].y - nodes[previous].y,
+            };
+            let next_edge = adjacency[current]
+                .iter()
+                .copied()
+                .filter(|edge| !used[*edge])
+                .max_by(|left, right| {
+                    continuation_score(incoming, current, edges[*left], &nodes).total_cmp(
+                        &continuation_score(incoming, current, edges[*right], &nodes),
+                    )
                 })
                 .ok_or_else(|| {
-                    format!("open contour ends at ({:.6}, {:.6})", current.x, current.y)
+                    format!(
+                        "open contour ends at ({:.6}, {:.6}) after {:.6} mm welding",
+                        nodes[current].x, nodes[current].y, tolerance
+                    )
                 })?;
-            used[next.0] = true;
-            current = segments[next.0][1 - next.1];
-            if PointKey::new(current) != start_key {
-                contour.push(current);
-            }
-            if contour.len() > segments.len() + 1 {
+            used[next_edge] = true;
+            let [first, second] = edges[next_edge];
+            let next = if first == current { second } else { first };
+            previous = current;
+            current = next;
+            if contour.len() > edges.len() + 1 {
                 return Err("contour traversal did not terminate".into());
             }
         }
-        remove_duplicate_neighbours(&mut contour);
+        remove_duplicate_neighbours(&mut contour, tolerance_squared);
         if contour.len() >= 3 && twice_area(&contour).abs() > 1.0e-12 {
             contours.push(contour);
         }
@@ -220,9 +325,92 @@ fn stitch_segments(segments: &[[Vec2; 2]]) -> std::result::Result<Vec<Vec<Vec2>>
     Ok(contours)
 }
 
-fn remove_duplicate_neighbours(contour: &mut Vec<Vec2>) {
-    contour.dedup_by(|left, right| PointKey::new(*left) == PointKey::new(*right));
-    if contour.len() > 1 && PointKey::new(contour[0]) == PointKey::new(*contour.last().unwrap()) {
+fn heal_odd_nodes(nodes: &mut [Vec2], endpoint_nodes: &mut [[usize; 2]], maximum_distance: f64) {
+    let mut degree = vec![0_usize; nodes.len()];
+    for [first, second] in parity_edges(endpoint_nodes) {
+        degree[first] += 1;
+        degree[second] += 1;
+    }
+    let odd = degree
+        .iter()
+        .enumerate()
+        .filter_map(|(node, degree)| (*degree % 2 != 0).then_some(node))
+        .collect::<Vec<_>>();
+    let limit_squared = maximum_distance * maximum_distance;
+    let mut candidates = Vec::new();
+    for (index, first) in odd.iter().copied().enumerate() {
+        for second in odd.iter().copied().skip(index + 1) {
+            let distance = distance_squared(nodes[first], nodes[second]);
+            if distance <= limit_squared {
+                candidates.push((distance, first, second));
+            }
+        }
+    }
+    // Globally shortest pairs win. Mutual-nearest matching is too strict for
+    // a cluster of three or four independently tessellated CAD face seams.
+    candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let mut paired = vec![false; nodes.len()];
+    for (_, node, candidate) in candidates {
+        if paired[node] || paired[candidate] {
+            continue;
+        }
+        paired[node] = true;
+        paired[candidate] = true;
+        nodes[node] = Vec2 {
+            x: (nodes[node].x + nodes[candidate].x) * 0.5,
+            y: (nodes[node].y + nodes[candidate].y) * 0.5,
+        };
+        for endpoints in endpoint_nodes.iter_mut() {
+            for endpoint in endpoints {
+                if *endpoint == candidate {
+                    *endpoint = node;
+                }
+            }
+        }
+    }
+}
+
+/// Coincident triangle/shell faces contribute the same intersection segment
+/// twice. Contour boundaries are an XOR: an even multiplicity is internal and
+/// disappears, while an odd multiplicity contributes one edge.
+fn parity_edges(endpoint_nodes: &[[usize; 2]]) -> Vec<[usize; 2]> {
+    let mut odd = HashMap::<(usize, usize), [usize; 2]>::new();
+    for [first, second] in endpoint_nodes.iter().copied() {
+        if first == second {
+            continue;
+        }
+        let key = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        if odd.remove(&key).is_none() {
+            odd.insert(key, [first, second]);
+        }
+    }
+    odd.into_values().collect()
+}
+
+fn continuation_score(incoming: Vec2, current: usize, edge: [usize; 2], nodes: &[Vec2]) -> f64 {
+    let next = if edge[0] == current { edge[1] } else { edge[0] };
+    let outgoing = Vec2 {
+        x: nodes[next].x - nodes[current].x,
+        y: nodes[next].y - nodes[current].y,
+    };
+    let denominator = (incoming.x * incoming.x + incoming.y * incoming.y).sqrt()
+        * (outgoing.x * outgoing.x + outgoing.y * outgoing.y).sqrt();
+    if denominator == 0.0 {
+        -1.0
+    } else {
+        (incoming.x * outgoing.x + incoming.y * outgoing.y) / denominator
+    }
+}
+
+fn remove_duplicate_neighbours(contour: &mut Vec<Vec2>, tolerance_squared: f64) {
+    contour.dedup_by(|left, right| distance_squared(*left, *right) <= tolerance_squared);
+    if contour.len() > 1
+        && distance_squared(contour[0], *contour.last().unwrap()) <= tolerance_squared
+    {
         contour.pop();
     }
 }
@@ -355,12 +543,27 @@ mod tests {
 
     #[test]
     fn slices_cube_at_layer_midpoints() {
-        let layers = slice_mesh(&cube(), 0.25).unwrap();
+        let layers = slice_mesh(&cube(), 0.25, 1.0e-5, 5.0e-5).unwrap();
         assert_eq!(layers.len(), 4);
         for layer in layers {
             assert_eq!(layer.contours.len(), 1);
             assert!((layer.area() - 1.0).abs() < 1.0e-9);
             assert_eq!(layer.segments.len(), 8); // STL face diagonals remain as collinear edges.
         }
+    }
+
+    #[test]
+    fn stitches_sub_resolution_cracks_but_rejects_real_open_contours() {
+        let almost_closed = [
+            [Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 1.0, y: 0.0 }],
+            [Vec2 { x: 1.001, y: 0.0 }, Vec2 { x: 1.0, y: 1.0 }],
+            [Vec2 { x: 1.0, y: 1.0 }, Vec2 { x: 0.0, y: 1.0 }],
+            [Vec2 { x: 0.0, y: 1.0 }, Vec2 { x: 0.0, y: 0.0 }],
+        ];
+        assert_eq!(
+            stitch_segments(&almost_closed, 0.002, 0.01).unwrap().len(),
+            1
+        );
+        assert!(stitch_segments(&almost_closed, 0.0001, 0.0005).is_err());
     }
 }

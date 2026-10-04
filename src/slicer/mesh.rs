@@ -3,10 +3,15 @@ use std::{
     fs::File,
     io::Read,
     path::Path,
-    process::Command,
 };
 
+#[cfg(not(anycubic_occt))]
+use std::process::Command;
+
 use zip::ZipArchive;
+
+#[cfg(anycubic_occt)]
+use std::ffi::{CStr, CString};
 
 use crate::{Error, Result};
 
@@ -46,7 +51,7 @@ pub(crate) struct Mesh {
 }
 
 impl Mesh {
-    pub fn load(path: &Path, gmsh_path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, gmsh_path: &Path, tessellation_error_mm: f64) -> Result<Self> {
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
@@ -55,7 +60,9 @@ impl Mesh {
         match extension.as_str() {
             "stl" => Self::read_stl(path),
             "3mf" => Self::read_3mf(path),
-            "step" | "stp" | "iges" | "igs" => Self::convert_cad(path, gmsh_path),
+            "step" | "stp" | "iges" | "igs" => {
+                Self::convert_cad(path, gmsh_path, tessellation_error_mm)
+            }
             _ => Err(Error::UnsupportedModelFormat(extension)),
         }
     }
@@ -125,31 +132,119 @@ impl Mesh {
         )
     }
 
-    fn convert_cad(path: &Path, gmsh_path: &Path) -> Result<Self> {
+    fn convert_cad(path: &Path, gmsh_path: &Path, tessellation_error_mm: f64) -> Result<Self> {
+        if !tessellation_error_mm.is_finite() || tessellation_error_mm <= 0.0 {
+            return Err(Error::InvalidModel(
+                "CAD tessellation error must be finite and positive".into(),
+            ));
+        }
+        #[cfg(anycubic_occt)]
+        {
+            let _ = gmsh_path;
+            Self::convert_cad_occt(path, tessellation_error_mm)
+        }
+        #[cfg(not(anycubic_occt))]
+        {
+            Self::convert_cad_gmsh(path, gmsh_path, tessellation_error_mm)
+        }
+    }
+
+    #[cfg(anycubic_occt)]
+    fn convert_cad_occt(path: &Path, tessellation_error_mm: f64) -> Result<Self> {
         let output = std::env::temp_dir().join(format!(
             "anycubicstudio-{}.stl",
             uuid::Uuid::new_v4().simple()
         ));
-        let result = Command::new(gmsh_path)
-            .arg(path)
-            .args(["-2", "-format", "stl", "-o"])
-            .arg(&output)
-            .args(["-v", "1"])
-            .output()
-            .map_err(|error| {
-                Error::MeshConverter(format!("could not start {}: {error}", gmsh_path.display()))
-            })?;
-        if !result.status.success() {
-            return Err(Error::MeshConverter(format!(
-                "{} exited with {}; stderr: {}",
-                gmsh_path.display(),
-                result.status,
-                String::from_utf8_lossy(&result.stderr).trim()
-            )));
+        let input = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            Error::MeshConverter("CAD input path contains an embedded NUL byte".into())
+        })?;
+        let output_text = CString::new(output.to_string_lossy().as_bytes()).map_err(|_| {
+            Error::MeshConverter("CAD output path contains an embedded NUL byte".into())
+        })?;
+        let mut error = vec![0_i8; 2048];
+        // About seven degrees prevents visible angular facets while chordal
+        // deflection remains tied to the printer pixel size.
+        let status = unsafe {
+            anycubic_occt_tessellate(
+                input.as_ptr(),
+                output_text.as_ptr(),
+                tessellation_error_mm,
+                0.12,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        if status != 0 {
+            let message = unsafe { CStr::from_ptr(error.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(Error::MeshConverter(if message.is_empty() {
+                format!("OpenCascade tessellation failed with status {status}")
+            } else {
+                message
+            }));
         }
-        let mesh = Self::read_stl(&output);
+        let converted = Self::read_stl(&output);
+        if let Some(debug_output) = std::env::var_os("ANYCUBIC_OCCT_DEBUG_STL") {
+            let _ = std::fs::copy(&output, debug_output);
+        }
         let _ = std::fs::remove_file(&output);
-        mesh
+        converted
+    }
+
+    #[cfg(not(anycubic_occt))]
+    fn convert_cad_gmsh(path: &Path, gmsh_path: &Path, tessellation_error_mm: f64) -> Result<Self> {
+        let output = std::env::temp_dir().join(format!(
+            "anycubicstudio-{}.stl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let converted = (|| {
+            // The inexpensive first pass supplies the physical size needed to
+            // choose a scale-aware surface mesh. A fixed global edge size is
+            // either visibly faceted on large curved parts or wasteful on
+            // small detailed ones.
+            run_gmsh(gmsh_path, path, &output, &[])?;
+            let coarse = Self::read_stl(&output)?;
+            let (minimum, maximum) = coarse.bounds();
+            let diagonal = ((maximum.x - minimum.x).powi(2)
+                + (maximum.y - minimum.y).powi(2)
+                + (maximum.z - minimum.z).powi(2))
+            .sqrt();
+            if !diagonal.is_finite() || diagonal <= 0.0 {
+                return Err(Error::InvalidModel(
+                    "CAD model has no finite physical extent".into(),
+                ));
+            }
+
+            // For a circular arc, chord ~= sqrt(8 * radius * sagitta).
+            // Using diagonal/2 as the largest representative radius gives a
+            // useful maximum edge while Gmsh's curvature sizing refines small
+            // radii. The lower bound prevents microscopic triangles that the
+            // target LCD cannot resolve.
+            let minimum_edge = (tessellation_error_mm * 8.0).max(diagonal * 1.0e-5);
+            let maximum_edge = (4.0 * diagonal * tessellation_error_mm)
+                .sqrt()
+                .max(minimum_edge)
+                .min((diagonal / 8.0).max(minimum_edge));
+            let mesh_minimum = (maximum_edge / 20.0)
+                .max(tessellation_error_mm * 2.0)
+                .min(maximum_edge);
+            let maximum_text = maximum_edge.to_string();
+            let minimum_text = mesh_minimum.to_string();
+            let options = [
+                ("Mesh.MeshSizeFromCurvature", "24"),
+                ("Mesh.MinimumCirclePoints", "24"),
+                ("Mesh.MinimumCurvePoints", "8"),
+                ("Mesh.MeshSizeMax", maximum_text.as_str()),
+                ("Mesh.MeshSizeMin", minimum_text.as_str()),
+                ("Mesh.Optimize", "1"),
+                ("Geometry.OCCFixSmallEdges", "1"),
+            ];
+            run_gmsh(gmsh_path, path, &output, &options)?;
+            Self::read_stl(&output)
+        })();
+        let _ = std::fs::remove_file(&output);
+        converted
     }
 
     /// Reads the mesh subset of the 3MF Core specification, including build
@@ -201,6 +296,53 @@ impl Mesh {
             ));
         }
         Ok(Self { triangles })
+    }
+
+    /// Snaps sub-resolution cracks to a shared 3D grid and removes triangles
+    /// that collapse or are exact duplicates after snapping. This is topology
+    /// repair within a caller-selected physical tolerance, not permission to
+    /// ignore a genuinely open shell.
+    pub fn repair_for_slicing(&mut self, tolerance_mm: f64) -> Result<()> {
+        if !tolerance_mm.is_finite() || tolerance_mm <= 0.0 {
+            return Err(Error::InvalidModel(
+                "mesh repair tolerance must be finite and positive".into(),
+            ));
+        }
+        let original_count = self.triangles.len();
+        let inverse = 1.0 / tolerance_mm;
+        let mut unique = HashSet::<[VertexKey; 3]>::new();
+        let minimum_area_vector_squared = tolerance_mm.powi(4) * 1.0e-4;
+        self.triangles.retain_mut(|triangle| {
+            let mut keys = [VertexKey::default(); 3];
+            for (point, key) in triangle.0.iter_mut().zip(&mut keys) {
+                *key = VertexKey::from_point(*point, inverse);
+                *point = key.to_point(tolerance_mm);
+            }
+            if keys[0] == keys[1] || keys[1] == keys[2] || keys[2] == keys[0] {
+                return false;
+            }
+            let first = triangle.0[1] - triangle.0[0];
+            let second = triangle.0[2] - triangle.0[0];
+            if first.cross(second).length_squared() <= minimum_area_vector_squared {
+                return false;
+            }
+            keys.sort_unstable();
+            unique.insert(keys)
+        });
+        if self.triangles.is_empty() {
+            return Err(Error::InvalidModel(
+                "mesh contains no non-degenerate triangles after repair".into(),
+            ));
+        }
+        if std::env::var_os("ANYCUBIC_OCCT_DIAGNOSTICS").is_some() {
+            eprintln!(
+                "mesh repair: {} input triangles, {} retained at {:.9} mm tolerance",
+                original_count,
+                self.triangles.len(),
+                tolerance_mm
+            );
+        }
+        Ok(())
     }
 
     pub fn bounds(&self) -> (Vec3, Vec3) {
@@ -274,6 +416,90 @@ impl Mesh {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(anycubic_occt)]
+unsafe extern "C" {
+    fn anycubic_occt_tessellate(
+        input: *const std::ffi::c_char,
+        output: *const std::ffi::c_char,
+        linear_deflection: f64,
+        angular_deflection: f64,
+        error: *mut std::ffi::c_char,
+        error_capacity: usize,
+    ) -> std::ffi::c_int;
+}
+
+#[cfg(not(anycubic_occt))]
+fn run_gmsh(gmsh_path: &Path, input: &Path, output: &Path, options: &[(&str, &str)]) -> Result<()> {
+    let mut command = Command::new(gmsh_path);
+    command
+        .arg(input)
+        .args(["-2", "-format", "stl", "-bin", "-o"])
+        .arg(output)
+        .args(["-v", "1"]);
+    for (name, value) in options {
+        command.args(["-setnumber", name, value]);
+    }
+    let result = command.output().map_err(|error| {
+        Error::MeshConverter(format!("could not start {}: {error}", gmsh_path.display()))
+    })?;
+    if !result.status.success() {
+        return Err(Error::MeshConverter(format!(
+            "{} exited with {}; stderr: {}",
+            gmsh_path.display(),
+            result.status,
+            String::from_utf8_lossy(&result.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+impl std::ops::Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
+}
+
+impl Vec3 {
+    fn cross(self, other: Self) -> Self {
+        Self {
+            x: self.y * other.z - self.z * other.y,
+            y: self.z * other.x - self.x * other.z,
+            z: self.x * other.y - self.y * other.x,
+        }
+    }
+
+    fn length_squared(self) -> f64 {
+        self.x * self.x + self.y * self.y + self.z * self.z
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct VertexKey(i64, i64, i64);
+
+impl VertexKey {
+    fn from_point(point: Vec3, inverse_tolerance: f64) -> Self {
+        Self(
+            (point.x * inverse_tolerance).round() as i64,
+            (point.y * inverse_tolerance).round() as i64,
+            (point.z * inverse_tolerance).round() as i64,
+        )
+    }
+
+    fn to_point(self, tolerance: f64) -> Vec3 {
+        Vec3 {
+            x: self.0 as f64 * tolerance,
+            y: self.1 as f64 * tolerance,
+            z: self.2 as f64 * tolerance,
+        }
     }
 }
 

@@ -28,7 +28,7 @@ The project supports two independent communication paths:
 | LAN SSDP/bootstrap/MQTT              | Implemented based on Workshop 4.1.8; test M7 Pro did not advertise the LAN API            |
 | Standalone browser-based OAuth login | Implemented with Workshop's browser authorization-code flow; passwords are never accepted by this program |
 | STL and Core mesh-3MF slicing        | Implemented natively in Rust; structurally validated PWSZ                                 |
-| STEP/STP/IGES slicing                | Implemented through Gmsh tessellation; tested with `example.step`                         |
+| STEP/STP/IGES slicing                | Native OpenCascade B-Rep healing/adaptive tessellation; Gmsh fallback; tested with `example.step` and `test/test.step` |
 | Automatic/manual vertical supports   | Light/medium/heavy presets, three pillar shapes, CLI/JSON/Rust/C configuration             |
 | PWSZ rendered previews               | Three real software-rendered views: 224×168, 336×252, and 800×600                          |
 | Graphical plate editor               | Qt 6/OpenGL multi-model GUI: drag/drop, selection, transform/mirror/layout, supports and M7 Pro build volume |
@@ -48,7 +48,12 @@ upload.
 ## Requirements
 
 * Rust with Edition 2024 support;
-* `gmsh` in `PATH` for STEP/STP/IGES input (not needed for STL or Core mesh-3MF);
+* for native STEP/STP/IGES input, a complete OpenCascade SDK including Data
+  Exchange headers/libraries; set `OPENCASCADE_ROOT` to its prefix. The build
+  automatically detects the supplied
+  `/home/dima/Documents/VSCode/C/opencascade` SDK and `/usr`;
+* `gmsh` in `PATH` is the CAD fallback when a complete OpenCascade SDK is not
+  available (neither dependency is needed for STL or Core mesh-3MF);
 * CMake 3.21+, Qt 6 Widgets/OpenGL/OpenGLWidgets, and a working OpenGL 3.3 driver for the optional viewer;
 * synchronized system date and time;
 * for Cloud mode — at least one successful login through an installed Photon Workshop instance;
@@ -463,7 +468,18 @@ cargo run --release -- slice \
 cargo run -- pwsz example.pwsz
 ```
 
-The slicer accepts STL, the Core mesh/build/component subset of 3MF, STEP/STP, and IGES. By default it centres the model in XY and places its lowest Z point on the bed. It rejects models outside the M7 Pro build volume.
+The slicer accepts STL, the Core mesh/build/component subset of 3MF, STEP/STP,
+and IGES. By default it centres the model in XY and places its lowest Z point
+on the bed. It rejects models outside the M7 Pro build volume.
+
+With OpenCascade enabled, CAD solids are healed and checked as B-Reps before
+tessellation. Chordal deflection is derived from half an LCD pixel and curved
+surfaces are refined adaptively. Only a B-Rep verified as closed receives the
+larger, chord-aware face-seam matching needed when adjacent CAD faces sample a
+common curve at different parameter positions. STL/3MF open contours remain
+fatal errors; the slicer does not silently discard them. Set
+`ANYCUBIC_OCCT_DIAGNOSTICS=1` for imported/sewn/fixed topology counts, or
+`ANYCUBIC_OCCT_DEBUG_STL=/tmp/model.stl` to retain the intermediate mesh.
 
 Each generated PWSZ contains three rendered model previews, per-layer vector
 polygons, resin/machine settings, print estimates, `scene.slice`, and
@@ -779,7 +795,11 @@ c++ example.cpp -Iinclude -Ltarget/release \
   -Wl,-rpath,"$PWD/target/release" -lanycubicstudio
 ```
 
-For Bambu Studio, add the header and shared library to a small CMake target and call the C ABI from the plate export action. STEP conversion currently starts `gmsh`; a later integration can pass Bambu Studio's already tessellated mesh through an additional in-memory ABI and avoid that process.
+For Bambu Studio, add the header and shared library to a small CMake target and
+call the C ABI from the plate export action. With `OPENCASCADE_ROOT` configured,
+STEP/IGES conversion runs in-process; without it the library starts `gmsh` as a
+fallback. A future in-memory mesh ABI can avoid either CAD conversion path when
+Bambu Studio already owns the tessellated mesh.
 
 ### Prepared test jobs
 
