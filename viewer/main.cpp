@@ -2,6 +2,7 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QDebug>
 #include <QFileInfo>
 #include <QOpenGLContext>
 #include <QSurfaceFormat>
@@ -20,9 +21,28 @@ int main(int argc, char *argv[]) {
     QCoreApplication::setOrganizationName("AnycubicStudioCommunity");
     QStringList initial_files;
     const QStringList arguments = application.arguments();
-    for (int index = 1; index < arguments.size(); ++index)
+    bool smoke_import = false;
+    for (int index = 1; index < arguments.size(); ++index) {
+        if (arguments[index] == "--smoke-import") {
+            smoke_import = true;
+            continue;
+        }
         initial_files.append(QFileInfo(arguments[index]).absoluteFilePath());
-    MainWindow window(initial_files);
+    }
+    MainWindow window(initial_files, nullptr, smoke_import);
+    if (smoke_import) {
+        const auto expected = static_cast<std::size_t>(initial_files.size());
+        if (window.importedObjectCount() != expected) {
+            qCritical().noquote()
+                << QString("Import smoke test failed: imported %1 of %2 object(s).")
+                       .arg(window.importedObjectCount())
+                       .arg(expected);
+            return 2;
+        }
+        qInfo().noquote()
+            << QString("Import smoke test passed: %1 object(s).").arg(expected);
+        return 0;
+    }
     window.show();
     return application.exec();
 }

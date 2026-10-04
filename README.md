@@ -83,6 +83,18 @@ Objects may also be supplied together at startup:
 target/release/anycubicstudio gui model.stl enclosure.step board-F_Cu.gbr board-PTH.drl
 ```
 
+To verify the complete import path without entering the GUI event loop, use
+the viewer's non-interactive regression mode. It runs each real importer and
+returns a non-zero status unless every supplied source becomes a scene object:
+
+```bash
+QT_QPA_PLATFORM=offscreen target/release/anycubic-viewer --smoke-import \
+  test/test.step test/test.stl test/test.gbr test/test.drl
+```
+
+Success ends with `Import smoke test passed: 4 object(s).`; Rust importer
+errors and the command that caused them are written to the terminal.
+
 `ANYCUBICSTUDIO_CLI=/absolute/path/to/anycubicstudio` can be set when the Qt
 executable and Rust executable are installed in different directories. The GUI
 never reimplements slicing or Cloud packets in C++: it invokes the Rust

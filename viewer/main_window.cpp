@@ -9,6 +9,7 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDesktopServices>
+#include <QDebug>
 #include <QDir>
 #include <QDockWidget>
 #include <QDoubleSpinBox>
@@ -175,7 +176,8 @@ QJsonObject supportJson(const SupportSettings &support) {
 
 } // namespace
 
-MainWindow::MainWindow(const QStringList &initial_files, QWidget *parent) : QMainWindow(parent) {
+MainWindow::MainWindow(const QStringList &initial_files, QWidget *parent, bool non_interactive)
+    : QMainWindow(parent), m_non_interactive(non_interactive) {
     setWindowTitle("Anycubic Studio — unified plate editor");
     resize(1500, 900);
     setAcceptDrops(true);
@@ -776,7 +778,11 @@ void MainWindow::importPaths(const QStringList &paths) {
 bool MainWindow::importPath(const QString &source) {
     const QFileInfo info(source);
     if (!info.isFile()) {
-        QMessageBox::warning(this, "Import", "File does not exist:\n" + source);
+        const QString message = "File does not exist:\n" + source;
+        if (m_non_interactive)
+            appendLog(message);
+        else
+            QMessageBox::warning(this, "Import", message);
         return false;
     }
     auto object = std::make_unique<SceneObject>();
@@ -796,19 +802,28 @@ bool MainWindow::importPath(const QString &source) {
         object->editable = false;
         QString error;
         if (!loadScene(object->path, object->visual, error)) {
-            QMessageBox::critical(this, "Import", error);
+            if (m_non_interactive)
+                appendLog(error);
+            else
+                QMessageBox::critical(this, "Import", error);
             return false;
         }
     } else {
-        QMessageBox::warning(this, "Import", "Unsupported format:\n" + object->path);
+        const QString message = "Unsupported format:\n" + object->path;
+        if (m_non_interactive)
+            appendLog(message);
+        else
+            QMessageBox::warning(this, "Import", message);
         return false;
     }
     if (object->type == SceneObjectType::Gerber && object->pcb.auto_mirror &&
         filenameSuggestsFrontMirror(object->path)) {
         appendLog("Auto-mirror X enabled for front-side KiCad layer " + object->display_name);
     }
-    if (object->editable && !rebuildObject(*object))
+    if (object->editable && !rebuildObject(*object, !m_non_interactive)) {
+        appendLog("Import failed for " + object->path);
         return false;
+    }
     appendLog("Imported " + typeName(object->type) + " object " + object->path);
     m_objects.push_back(std::move(object));
     return true;
@@ -1797,12 +1812,9 @@ QByteArray MainWindow::projectJson(const SceneObject *isolated,
                              {"hollow", false},
                              {"gmsh_path", "gmsh"}};
     QJsonArray objects;
-    for (const auto &owned : m_objects) {
-        const SceneObject *object = owned.get();
-        if (isolated && object != isolated)
-            continue;
-        if (!object->editable || (!isolated && !object->visible))
-            continue;
+    const auto append_object = [&](const SceneObject *object) {
+        if (!object || !object->editable || (!isolated && !object->visible))
+            return;
         QString drill_mode = object->pcb.drill_mode;
         if (isolated == object && expose_isolated_drill)
             drill_mode = "expose";
@@ -1818,6 +1830,15 @@ QByteArray MainWindow::projectJson(const SceneObject *isolated,
                                    {"transform", transformJson(*object)},
                                    {"supports", supportJson(object->supports)},
                                    {"pcb", pcb}});
+    };
+    if (isolated) {
+        // A newly imported object is previewed before ownership is transferred
+        // to m_objects, so it must be serialized directly rather than found in
+        // the current scene collection.
+        append_object(isolated);
+    } else {
+        for (const auto &owned : m_objects)
+            append_object(owned.get());
     }
     return QJsonDocument(QJsonObject{{"config", config}, {"objects", objects}})
         .toJson(QJsonDocument::Indented);
@@ -1856,6 +1877,11 @@ bool MainWindow::writeTemporaryProject(QString &path, QString &error,
 }
 
 void MainWindow::appendLog(const QString &text) {
-    if (m_log && !text.trimmed().isEmpty())
-        m_log->appendPlainText(text.trimmed());
+    const QString message = text.trimmed();
+    if (message.isEmpty())
+        return;
+    if (m_log)
+        m_log->appendPlainText(message);
+    if (m_non_interactive)
+        qInfo().noquote() << message;
 }

@@ -29,7 +29,9 @@ class PrintView;
 
 class MainWindow final : public QMainWindow {
 public:
-    explicit MainWindow(const QStringList &initial_files = {}, QWidget *parent = nullptr);
+    explicit MainWindow(const QStringList &initial_files = {}, QWidget *parent = nullptr,
+                        bool non_interactive = false);
+    std::size_t importedObjectCount() const noexcept { return m_objects.size(); }
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -191,5 +193,6 @@ private:
     bool m_last_job_is_pcb = false;
     double m_last_pcb_exposure = 0.0;
     bool m_loading_controls = false;
+    bool m_non_interactive = false;
     quint64 m_next_object_id = 1;
 };
