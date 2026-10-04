@@ -39,15 +39,27 @@ async fn main() -> anyhow::Result<()> {
     }
     if matches!(
         host.as_deref(),
-        Some("project-slice") | Some("project-viewer-scene")
+        Some("project-slice") | Some("project-viewer-scene") | Some("project-object-viewer-scene")
     ) {
         let operation = host.as_deref().expect("matched project operation");
         let project_path = arguments.next().ok_or_else(|| {
-            anyhow::anyhow!("usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>")
+            anyhow::anyhow!(
+                "usage: anycubicstudio {operation} <PROJECT.json> [OBJECT_INDEX] <OUTPUT>"
+            )
         })?;
-        let output = arguments.next().ok_or_else(|| {
-            anyhow::anyhow!("usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>")
-        })?;
+        let object_index = if operation == "project-object-viewer-scene" {
+            Some(
+                arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing object index"))?
+                    .parse::<usize>()?,
+            )
+        } else {
+            None
+        };
+        let output = arguments
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing project output path"))?;
         if arguments.next().is_some() {
             return Err(anyhow::anyhow!(
                 "usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>"
@@ -66,7 +78,11 @@ async fn main() -> anyhow::Result<()> {
                 report.output_bytes,
             );
         } else {
-            let report = anycubicstudio::slicer::export_project_viewer_scene(&project, output)?;
+            let report = if let Some(index) = object_index {
+                anycubicstudio::slicer::export_project_object_viewer_scene(&project, index, output)?
+            } else {
+                anycubicstudio::slicer::export_project_viewer_scene(&project, output)?
+            };
             println!(
                 "Created project viewer scene: {} model + {} support triangles ({} supports), {} layers, {} bytes",
                 report.model_triangle_count,

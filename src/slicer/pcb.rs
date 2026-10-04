@@ -2031,6 +2031,28 @@ pub(crate) fn prepare_scene_artwork(
     objects: &[&SceneObjectConfig],
     config: &SlicerConfig,
 ) -> Result<PreparedSceneArtwork> {
+    prepare_scene_artwork_filtered(objects, config, None)
+}
+
+/// Generates one object's viewer geometry while retaining the source-space
+/// bounds of every PCB object. This keeps independently selectable Gerber and
+/// drill previews in the same KiCad coordinate frame.
+pub(crate) fn prepare_scene_artwork_object(
+    objects: &[&SceneObjectConfig],
+    config: &SlicerConfig,
+    object_index: usize,
+) -> Result<PreparedSceneArtwork> {
+    if object_index >= objects.len() {
+        return Err(invalid("PCB preview object index is out of range"));
+    }
+    prepare_scene_artwork_filtered(objects, config, Some(object_index))
+}
+
+fn prepare_scene_artwork_filtered(
+    objects: &[&SceneObjectConfig],
+    config: &SlicerConfig,
+    object_filter: Option<usize>,
+) -> Result<PreparedSceneArtwork> {
     if objects.is_empty() {
         return Err(invalid("scene contains no PCB artwork objects"));
     }
@@ -2084,6 +2106,11 @@ pub(crate) fn prepare_scene_artwork(
         x: (source_bounds[0] + source_bounds[2]) * 0.5,
         y: (source_bounds[1] + source_bounds[3]) * 0.5,
     };
+    let automatic_front_group = parsed.iter().any(|(object, _)| {
+        object.source_type == SceneObjectType::Gerber
+            && object.pcb.auto_mirror_front_layers
+            && filename_suggests_front_mirror(&object.input)
+    });
     let half_x = config.machine.build_volume_mm[0] * 0.5;
     let half_y = config.machine.build_volume_mm[1] * 0.5;
     let mut layers = BTreeMap::<usize, LayerRaster>::new();
@@ -2116,9 +2143,7 @@ pub(crate) fn prepare_scene_artwork(
                 object.input.display()
             )));
         }
-        let automatic_mirror = object.source_type == SceneObjectType::Gerber
-            && object.pcb.auto_mirror_front_layers
-            && filename_suggests_front_mirror(&object.input);
+        let automatic_mirror = object.pcb.auto_mirror_front_layers && automatic_front_group;
         let target_center = if transform.auto_center_xy {
             Point {
                 x: transform.translation_mm[0],
@@ -2151,6 +2176,9 @@ pub(crate) fn prepare_scene_artwork(
     // file's polarity semantics. Drill objects then clear/expose the result.
     for (object, source) in parsed
         .iter()
+        .enumerate()
+        .filter(|(index, _)| object_filter.is_none_or(|filter| filter == *index))
+        .map(|(_, value)| value)
         .filter(|(object, _)| object.source_type == SceneObjectType::Gerber)
     {
         let (artwork, layer_index, automatically_mirrored) = transform_artwork(object, source)?;
@@ -2215,6 +2243,9 @@ pub(crate) fn prepare_scene_artwork(
 
     for (object, source) in parsed
         .iter()
+        .enumerate()
+        .filter(|(index, _)| object_filter.is_none_or(|filter| filter == *index))
+        .map(|(_, value)| value)
         .filter(|(object, _)| object.source_type == SceneObjectType::Drill)
     {
         if object.pcb.drill_mode == DrillMode::Ignore {

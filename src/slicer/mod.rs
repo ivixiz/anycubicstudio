@@ -398,6 +398,56 @@ pub fn export_project_viewer_scene(
     viewer_report(&scene, output)
 }
 
+/// Exports one independently selectable object while using the complete PCB
+/// source set as its alignment reference. Mesh objects are isolated directly;
+/// Gerber/DRL objects keep the common KiCad source centre used by final slicing.
+pub fn export_project_object_viewer_scene(
+    project: &SceneProject,
+    object_index: usize,
+    output: impl AsRef<Path>,
+) -> Result<ViewerSceneReport> {
+    let target = project.objects.get(object_index).ok_or_else(|| {
+        Error::InvalidModel(format!("scene object index {object_index} is out of range"))
+    })?;
+    if !target.visible {
+        return Err(Error::InvalidModel(format!(
+            "scene object index {object_index} is hidden"
+        )));
+    }
+    let mut isolated = project.clone();
+    let scene = if target.source_type == SceneObjectType::Model {
+        for (index, object) in isolated.objects.iter_mut().enumerate() {
+            object.visible = index == object_index;
+        }
+        prepare_project(&isolated)?
+    } else {
+        if isolated.objects[object_index].source_type == SceneObjectType::Drill {
+            isolated.objects[object_index].pcb.drill_mode = pcb::DrillMode::Expose;
+        }
+        for object in &mut isolated.objects {
+            if object.source_type == SceneObjectType::Model {
+                object.visible = false;
+            }
+        }
+        let artwork_index = isolated
+            .objects
+            .iter()
+            .take(object_index)
+            .filter(|object| object.visible && object.source_type != SceneObjectType::Model)
+            .count();
+        prepare_project_filtered(&isolated, Some(artwork_index))?
+    };
+    let output = output.as_ref();
+    write_viewer_scene(
+        output,
+        &scene.config,
+        &scene.model,
+        &scene.supports,
+        &scene.layers,
+    )?;
+    viewer_report(&scene, output)
+}
+
 fn slice_report(scene: &PreparedScene, output: &Path) -> Result<SliceReport> {
     Ok(SliceReport {
         triangle_count: scene.combined.triangles.len(),
@@ -436,6 +486,13 @@ fn prepare_scene(input: &Path, config: &SlicerConfig) -> Result<PreparedScene> {
 }
 
 fn prepare_project(project: &SceneProject) -> Result<PreparedScene> {
+    prepare_project_filtered(project, None)
+}
+
+fn prepare_project_filtered(
+    project: &SceneProject,
+    artwork_filter: Option<usize>,
+) -> Result<PreparedScene> {
     if !project.objects.iter().any(|object| object.visible) {
         return Err(Error::InvalidModel(
             "scene project contains no visible objects".into(),
@@ -521,10 +578,11 @@ fn prepare_project(project: &SceneProject) -> Result<PreparedScene> {
     let artwork = if visible_artwork.is_empty() {
         None
     } else {
-        Some(pcb::prepare_scene_artwork(
-            &visible_artwork,
-            &effective_config,
-        )?)
+        Some(if let Some(index) = artwork_filter {
+            pcb::prepare_scene_artwork_object(&visible_artwork, &effective_config, index)?
+        } else {
+            pcb::prepare_scene_artwork(&visible_artwork, &effective_config)?
+        })
     };
     let mut scene = if pcb_only {
         PreparedScene {
@@ -880,5 +938,68 @@ mod scene_tests {
         assert!(report.layer_count > 0);
         assert!(report.output_bytes > 0);
         std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn project_object_previews_keep_the_shared_pcb_coordinate_frame() {
+        let mut drill = object(fixture("test.drl"), SceneObjectType::Drill);
+        drill.pcb.drill_mode = pcb::DrillMode::Expose;
+        let project = SceneProject {
+            config: SlicerConfig::default(),
+            objects: vec![object(fixture("test.gbr"), SceneObjectType::Gerber), drill],
+        };
+        let combined = prepare_project(&project).unwrap();
+        let gerber = prepare_project_filtered(&project, Some(0)).unwrap();
+        let drill = prepare_project_filtered(&project, Some(1)).unwrap();
+        let union = [
+            gerber.bounds[0].min(drill.bounds[0]),
+            gerber.bounds[1].min(drill.bounds[1]),
+            gerber.bounds[3].max(drill.bounds[3]),
+            gerber.bounds[4].max(drill.bounds[4]),
+        ];
+        for (actual, expected) in union.into_iter().zip([
+            combined.bounds[0],
+            combined.bounds[1],
+            combined.bounds[3],
+            combined.bounds[4],
+        ]) {
+            assert!((actual - expected).abs() < 0.03, "{actual} != {expected}");
+        }
+        let drill_center = [
+            (drill.bounds[0] + drill.bounds[3]) * 0.5,
+            (drill.bounds[1] + drill.bounds[4]) * 0.5,
+        ];
+        assert!(drill_center[0].abs() > 1.0e-3 || drill_center[1].abs() > 1.0e-3);
+    }
+
+    #[test]
+    fn front_layer_auto_mirror_keeps_drill_and_gerber_in_one_group() {
+        let front =
+            std::env::temp_dir().join(format!("board-F_Cu-{}.gbr", uuid::Uuid::new_v4().simple()));
+        std::fs::copy(fixture("test.gbr"), &front).unwrap();
+        let mut gerber = object(front.clone(), SceneObjectType::Gerber);
+        gerber.pcb.auto_mirror_front_layers = true;
+        let mut drill = object(fixture("test.drl"), SceneObjectType::Drill);
+        drill.pcb.auto_mirror_front_layers = true;
+        drill.pcb.drill_mode = pcb::DrillMode::Expose;
+        let automatic = SceneProject {
+            config: SlicerConfig::default(),
+            objects: vec![gerber, drill],
+        };
+        let automatic_drill = prepare_project_filtered(&automatic, Some(1)).unwrap();
+        let mut explicit = automatic.clone();
+        for object in &mut explicit.objects {
+            object.pcb.auto_mirror_front_layers = false;
+            object.transform.scale = [-1.0, 1.0, 1.0];
+        }
+        let explicit_drill = prepare_project_filtered(&explicit, Some(1)).unwrap();
+        for (actual, expected) in automatic_drill
+            .bounds
+            .into_iter()
+            .zip(explicit_drill.bounds)
+        {
+            assert!((actual - expected).abs() < 0.03, "{actual} != {expected}");
+        }
+        std::fs::remove_file(front).unwrap();
     }
 }
