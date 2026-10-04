@@ -270,6 +270,84 @@ caller-provided PCB mask. The Rust start path adds an online/idle preflight and
 a 300-second client-side limit; cancel intentionally remains available without
 an idle precondition.
 
+The UI-side call chain reinforces that closed shape. `FUN_1800bb200 @
+0x1800bb200` maps the three UI selections to raw values 2, 4, and 1, then the
+Qt static metacall in `FUN_180179f80 @ 0x180179f80` forwards only
+`(printer, exposure_type, last_time)` to `startExposure`. All inspected Cloud
+and LAN call sites eventually reach the two-field serializers above. The
+response parser `FUN_1800dcca0 @ 0x1800dcca0` consumes only envelope/status
+fields (`type`, `action`, `code`, `state`, `timestamp`, and `msgid`). No
+parallel image-bearing exposure operation was found in `accloud`, `QMqttSDK`,
+`mqtt_client`, or `mach_mqtt`.
+
+### RERF/calibration exposure is still a sliced print
+
+The `CalibrationExposurePopup` and RERF strings initially looked like a
+possible arbitrary-mask service route, but their call chain proves otherwise:
+
+| Evidence | Recovered behaviour |
+|---|---|
+| `FUN_1802cd2c0 @ 0x1802cd2c0` | Stores the selected partition count. |
+| `FUN_1802cdb30 @ 0x1802cdb30` | Copies the partition exposure-time array. |
+| `FUN_1802c96b0 @ 0x1802c96b0` | Marks/positions RERF models and invokes `runSliceTask`. |
+| `FUN_1802cce60 @ 0x1802cce60` | Invokes `saveSlicedFile`. |
+| `FUN_1802cd050 @ 0x1802cd050` | Invokes `saveSlicedFileToTempFile`. |
+| `FUN_180086cb0 @ 0x180086cb0` | Toggles the application's RERF editor/model state; it is not a printer-network sender. |
+| `lcd_func::Func_Rerf::ToJsonString @ 0x18002460e` in `wrapper_slicer_engine_r` | Emits `rerf_function` with `enable`, `model_type`, `model_name`, `partition_num`, and `partition_exposure_array`. |
+
+The official M7 Pro `R_E_R_F.pwsz`, downloaded from Anycubic's
+[model download page](https://wiki.anycubic.com/en/resin-3d-printer/photon-mono-m7-pro),
+provides an independent file-level check. It is a Workshop 3.3.0 archive with
+288 `layer_*.pwszImg` members. `layers_controller.conf` requests an 8 mm lift
+at 6 mm/s on every layer, 25 s exposure for the first five layers, and 1 s for
+the remaining layers. The archive has no `lcd_function.json` and no separate
+display command. Its SHA-256 at the time of analysis was
+`badb86c7b3dcd8583361ba7fba75d99b0235fb298496de6997dcb5fa368c6fc3`.
+The file was inspected only; it was not uploaded or started.
+
+Every non-layer member was also checked. `scene.slice` is a conventional
+288-record geometry summary spanning Z=0.025..14.375 mm; its global and
+per-record reserved words are zero and it has no trailing control block.
+`FUN_180342ad0 @ 0x180342ad0` and `FUN_180342d90 @ 0x180342d90` are the
+corresponding modern serializers. ZIP central-directory extra fields are only
+per-member SHA-256 records, not hidden RERF commands. Modern Workshop can write
+explicit RERF metadata through `pwsz_file_base::write_rerf_paras @
+0x18000bc6c`, with setter/parser `set_lcd_rtrf_func_info @ 0x180002301` and
+getter `get_lcd_rtrf_func_info @ 0x18002627e`; the older official file predates
+that member. Firmware-side special-casing of the historical `R_E_R_F` filename
+cannot be excluded without firmware, but the file still unambiguously asks for
+288 moving print cycles and cannot serve as a no-motion PCB exposure.
+
+The firmware-side meaning of those fields is not present in the Windows
+binaries, but their producer is unambiguously part of the slice/save pipeline.
+Anycubic's official
+[M7 Pro firmware log](https://wiki.anycubic.com/en/resin-3d-printer/photon-mono-m7-pro/firmware-update-log)
+likewise describes 4/6/8-partition calibration and adjustment of partition
+exposure times, not an arbitrary framebuffer upload. Thus RERF may change how
+a calibration print's regions are exposed, but it does not bypass normal
+print-start preparation and is not an LCD-test replacement.
+
+No `custom-exposure` packet is implemented because none is evidenced. The
+next required reverse-engineering artifact is the printer's Linux/system
+application firmware or a read-only root-filesystem dump—not the published
+FPGA bitstream. The minimum targets are the MQTT/Cloud exposure-order-301
+handler, the normal layer decoder, and the LCD/framebuffer driver or display
+daemon. Only those binaries can establish whether a hidden safe path exists
+or whether a firmware modification is required.
+
+There is one concrete OTA acquisition lead. The QCloudSDK response parser
+`FUN_1801f55a0 @ 0x1801f55a0` recognises `firmware_url`, `firmware_name`,
+`firmware_version`, `firmware_size`, `peripheral_version`, `machine_version`,
+`min_model_firmware_id`, `force_update`, and `update_desc`. The observed
+printer-info response for the already-current 4.0.8.6 installation instead
+reported `need_update = 0` and omitted the URL. Capturing the same response
+when a newer OTA is offered could therefore yield the system package. A local
+search of the Workshop installation, its updater/cache, crash dump, and the
+decompilation workspace found only Windows x86-64 application files; it found
+no ARM/ELF executable, U-Boot/kernel image, SquashFS/UBI image, or system
+firmware package. Logs containing Cloud tokens must not be published while
+pursuing this lead.
+
 ## Transport map
 
 | Purpose | Transport | Endpoint / topic | Evidence |
@@ -502,7 +580,7 @@ src/
 └── error.rs      typed errors
 ```
 
-`cargo test` (12 tests) and `cargo clippy --all-targets -- -D warnings` pass.
+`cargo test` (31 tests) and `cargo clippy --all-targets -- -D warnings` pass.
 No-argument CLI runs exact SSDP discovery. `cargo run -- <host> <info-port>`
 does only `GET /info`, never writes state or prints secrets.
 
@@ -523,6 +601,12 @@ All direct-LAN tests were read-only:
   access-controlled service, not an assumed upload/control port;
 - no bootstrap, MQTT login, status or telemetry request was possible; no
   command, upload, movement, heating, or print action was sent.
+
+A follow-up targeted service scan on 2026-10-03 again found the recovered
+HTTP/MQTT/camera ports closed. Only `23/tcp` (`tcpwrapped`) and the still
+unidentified `11311/tcp` accepted connections among ports 22, 23, 80, 443,
+1883, 8883, 9883, 11311, 18088, and 18910. No application payload or hardware
+command was sent during that recheck.
 
 This points to an inactive LAN service, a sleeping/offline printer network
 stack, or a legacy/different network module. Confirm the printer's on-screen
