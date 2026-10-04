@@ -6,7 +6,7 @@
 //! retaining the exact shared coordinate system used by KiCad drill files.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     f64::consts::PI,
     path::{Path, PathBuf},
 };
@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use crate::{Error, Result};
 
 use super::{
-    MachineConfig, PrintConfig, SlicerConfig, SupportConfig, Transform,
+    MachineConfig, PrintConfig, SceneObjectConfig, SceneObjectType, SlicerConfig, SupportConfig,
+    Transform,
     geometry::{LayerSlice, Vec2, layer_from_contours},
     mesh::Mesh,
     render::RenderedImage,
@@ -34,6 +35,30 @@ pub enum DrillMode {
     Expose,
     /// The Excellon file is parsed and aligned but does not affect the image.
     Ignore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PcbObjectConfig {
+    pub exposure_s: f64,
+    #[serde(default = "default_auto_mirror_front_layers")]
+    pub auto_mirror_front_layers: bool,
+    pub invert: bool,
+    pub invert_margin_mm: f64,
+    pub drill_mode: DrillMode,
+    pub simplify_tolerance_mm: f64,
+}
+
+impl Default for PcbObjectConfig {
+    fn default() -> Self {
+        Self {
+            exposure_s: 60.0,
+            auto_mirror_front_layers: true,
+            invert: false,
+            invert_margin_mm: 0.0,
+            drill_mode: DrillMode::Clear,
+            simplify_tolerance_mm: 0.012,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1304,6 +1329,7 @@ impl PixelRect {
     }
 }
 
+#[derive(Clone)]
 struct BitGrid {
     width: u32,
     height: u32,
@@ -1749,6 +1775,33 @@ struct PreparedExposure {
     warnings: Vec<String>,
 }
 
+pub(crate) struct PreparedSceneArtwork {
+    pub layers: Vec<LayerSlice>,
+    pub previews: Vec<RenderedImage>,
+    pub bounds: [f64; 4],
+    pub warnings: Vec<String>,
+}
+
+struct LayerRaster {
+    grid: BitGrid,
+    active_rect: Option<PixelRect>,
+    simplify_tolerance_mm: f64,
+}
+
+impl LayerRaster {
+    fn new(machine: &MachineConfig) -> Result<Self> {
+        Ok(Self {
+            grid: BitGrid::new(machine)?,
+            active_rect: None,
+            simplify_tolerance_mm: f64::INFINITY,
+        })
+    }
+
+    fn include(&mut self, rect: PixelRect) {
+        self.active_rect = Some(self.active_rect.map_or(rect, |current| current.union(rect)));
+    }
+}
+
 fn validate_config(config: &PcbExposureConfig) -> Result<()> {
     if !config.exposure_s.is_finite() || config.exposure_s <= 0.0 {
         return Err(invalid(
@@ -1966,6 +2019,279 @@ fn prepare_exposure(
     Ok(PreparedExposure {
         grid,
         layer,
+        warnings,
+    })
+}
+
+/// Composes Gerber and Excellon objects into the same Z-indexed layer stream
+/// used by mesh objects. All PCB sources share their original KiCad coordinate
+/// frame, then receive their own scene transform. This preserves automatic
+/// drill alignment while still allowing independent selection and movement.
+pub(crate) fn prepare_scene_artwork(
+    objects: &[&SceneObjectConfig],
+    config: &SlicerConfig,
+) -> Result<PreparedSceneArtwork> {
+    if objects.is_empty() {
+        return Err(invalid("scene contains no PCB artwork objects"));
+    }
+    if !config.print.layer_height_mm.is_finite() || config.print.layer_height_mm <= 0.0 {
+        return Err(invalid("layer height must be finite and greater than zero"));
+    }
+
+    let mut parsed = Vec::with_capacity(objects.len());
+    for object in objects {
+        if !object.pcb.exposure_s.is_finite() || object.pcb.exposure_s <= 0.0 {
+            return Err(invalid(format!(
+                "{} has an invalid PCB exposure time",
+                object.input.display()
+            )));
+        }
+        if !object.pcb.invert_margin_mm.is_finite()
+            || object.pcb.invert_margin_mm < 0.0
+            || !object.pcb.simplify_tolerance_mm.is_finite()
+            || object.pcb.simplify_tolerance_mm < 0.0
+        {
+            return Err(invalid(format!(
+                "{} has invalid PCB raster settings",
+                object.input.display()
+            )));
+        }
+        let artwork = match object.source_type {
+            SceneObjectType::Gerber => parse_gerber(&object.input)?,
+            SceneObjectType::Drill => parse_excellon(&object.input)?,
+            SceneObjectType::Model => {
+                return Err(invalid("mesh object passed to the PCB compositor"));
+            }
+        };
+        parsed.push((*object, artwork));
+    }
+    let source_bounds = parsed
+        .iter()
+        .filter_map(|(_, artwork)| operations_bounds(&artwork.operations))
+        .fold(None, |combined: Option<[f64; 4]>, bounds| {
+            Some(match combined {
+                None => bounds,
+                Some(current) => [
+                    current[0].min(bounds[0]),
+                    current[1].min(bounds[1]),
+                    current[2].max(bounds[2]),
+                    current[3].max(bounds[3]),
+                ],
+            })
+        })
+        .ok_or_else(|| invalid("PCB scene has no measurable artwork bounds"))?;
+    let source_center = Point {
+        x: (source_bounds[0] + source_bounds[2]) * 0.5,
+        y: (source_bounds[1] + source_bounds[3]) * 0.5,
+    };
+    let half_x = config.machine.build_volume_mm[0] * 0.5;
+    let half_y = config.machine.build_volume_mm[1] * 0.5;
+    let mut layers = BTreeMap::<usize, LayerRaster>::new();
+    let mut warnings = Vec::new();
+
+    let transform_artwork = |object: &SceneObjectConfig,
+                             artwork: &ParsedArtwork|
+     -> Result<(ParsedArtwork, usize, bool)> {
+        let transform = &object.transform;
+        if transform
+            .translation_mm
+            .iter()
+            .chain(transform.rotation_deg.iter())
+            .chain(transform.scale.iter())
+            .any(|value| !value.is_finite())
+            || transform.scale.contains(&0.0)
+        {
+            return Err(invalid(format!(
+                "{} has a non-finite or zero transform",
+                object.input.display()
+            )));
+        }
+        if transform.translation_mm[2] < 0.0
+            || transform.rotation_deg[0].abs() > 1.0e-9
+            || transform.rotation_deg[1].abs() > 1.0e-9
+            || (transform.scale[0].abs() - transform.scale[1].abs()).abs() > 1.0e-9
+        {
+            return Err(invalid(format!(
+                "{}: PCB objects support non-negative Z, Z rotation and uniform XY scale",
+                object.input.display()
+            )));
+        }
+        let automatic_mirror = object.source_type == SceneObjectType::Gerber
+            && object.pcb.auto_mirror_front_layers
+            && filename_suggests_front_mirror(&object.input);
+        let target_center = if transform.auto_center_xy {
+            Point {
+                x: transform.translation_mm[0],
+                y: transform.translation_mm[1],
+            }
+        } else {
+            Point {
+                x: source_center.x + transform.translation_mm[0],
+                y: source_center.y + transform.translation_mm[1],
+            }
+        };
+        let artwork_transform = ArtworkTransform {
+            source_center,
+            target_center,
+            radians: transform.rotation_deg[2].to_radians(),
+            scale: transform.scale[0].abs(),
+            mirror_x: (transform.scale[0] < 0.0) ^ automatic_mirror,
+            mirror_y: transform.scale[1] < 0.0,
+        };
+        let mut transformed = artwork.clone();
+        for operation in &mut transformed.operations {
+            operation.shape = operation.shape.transformed(&artwork_transform);
+        }
+        let layer =
+            (transform.translation_mm[2] / config.print.layer_height_mm + 1.0e-9).floor() as usize;
+        Ok((transformed, layer, automatic_mirror))
+    };
+
+    // Gerber layers are composed independently before OR-ing, preserving each
+    // file's polarity semantics. Drill objects then clear/expose the result.
+    for (object, source) in parsed
+        .iter()
+        .filter(|(object, _)| object.source_type == SceneObjectType::Gerber)
+    {
+        let (artwork, layer_index, automatically_mirrored) = transform_artwork(object, source)?;
+        let bounds = operations_bounds(&artwork.operations)
+            .ok_or_else(|| invalid(format!("{} is empty", object.input.display())))?;
+        let margin = if object.pcb.invert {
+            object.pcb.invert_margin_mm
+        } else {
+            0.0
+        };
+        if bounds[0] - margin < -half_x
+            || bounds[2] + margin > half_x
+            || bounds[1] - margin < -half_y
+            || bounds[3] + margin > half_y
+        {
+            return Err(invalid(format!(
+                "{} lies outside the centered LCD after its scene transform",
+                object.input.display()
+            )));
+        }
+        let mut local = BitGrid::new(&config.machine)?;
+        let mut local_rect = None::<PixelRect>;
+        for operation in &artwork.operations {
+            if let Some(rect) = raster_operation(&mut local, operation) {
+                local_rect = Some(local_rect.map_or(rect, |current| current.union(rect)));
+            }
+        }
+        if artwork.negative
+            && let Some(rect) = invert_rect(&mut local, bounds)
+        {
+            local_rect = Some(local_rect.map_or(rect, |current| current.union(rect)));
+        }
+        if object.pcb.invert {
+            let inverted_bounds = [
+                bounds[0] - margin,
+                bounds[1] - margin,
+                bounds[2] + margin,
+                bounds[3] + margin,
+            ];
+            if let Some(rect) = invert_rect(&mut local, inverted_bounds) {
+                local_rect = Some(local_rect.map_or(rect, |current| current.union(rect)));
+            }
+        }
+        let target = layers
+            .entry(layer_index)
+            .or_insert(LayerRaster::new(&config.machine)?);
+        target.grid.or_assign(&local);
+        if let Some(rect) = local_rect {
+            target.include(rect);
+        }
+        target.simplify_tolerance_mm = target
+            .simplify_tolerance_mm
+            .min(object.pcb.simplify_tolerance_mm);
+        warnings.extend(artwork.warnings);
+        if automatically_mirrored {
+            warnings.push(format!(
+                "automatically mirrored {} because its filename identifies a KiCad front layer",
+                object.input.display()
+            ));
+        }
+    }
+
+    for (object, source) in parsed
+        .iter()
+        .filter(|(object, _)| object.source_type == SceneObjectType::Drill)
+    {
+        if object.pcb.drill_mode == DrillMode::Ignore {
+            continue;
+        }
+        let (artwork, layer_index, _) = transform_artwork(object, source)?;
+        let target = layers
+            .entry(layer_index)
+            .or_insert(LayerRaster::new(&config.machine)?);
+        for source in &artwork.operations {
+            let operation = Operation {
+                shape: source.shape.clone(),
+                dark: object.pcb.drill_mode == DrillMode::Expose,
+            };
+            if let Some(rect) = raster_operation(&mut target.grid, &operation) {
+                target.include(rect);
+            }
+        }
+        target.simplify_tolerance_mm = target
+            .simplify_tolerance_mm
+            .min(object.pcb.simplify_tolerance_mm);
+        warnings.extend(artwork.warnings);
+    }
+
+    let Some(maximum_layer) = layers.keys().next_back().copied() else {
+        return Err(invalid(
+            "PCB scene has no exposable Gerber data; a clear-only drill file is not a layer",
+        ));
+    };
+    let mut preview_grid = BitGrid::new(&config.machine)?;
+    let mut final_layers = Vec::with_capacity(maximum_layer + 1);
+    let mut combined_bounds = None::<[f64; 4]>;
+    for index in 0..=maximum_layer {
+        let contours = if let Some(raster) = layers.get(&index) {
+            preview_grid.or_assign(&raster.grid);
+            match raster.active_rect {
+                Some(rect) if raster.grid.count() > 0 => bitmap_contours(
+                    &raster.grid,
+                    rect,
+                    if raster.simplify_tolerance_mm.is_finite() {
+                        raster.simplify_tolerance_mm
+                    } else {
+                        0.0
+                    },
+                ),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let layer = layer_from_contours(
+            index as u32,
+            (index as f64 + 0.5) * config.print.layer_height_mm,
+            contours,
+        );
+        if !layer.contours.is_empty() {
+            combined_bounds = Some(match combined_bounds {
+                None => layer.bounds,
+                Some(bounds) => [
+                    bounds[0].min(layer.bounds[0]),
+                    bounds[1].min(layer.bounds[1]),
+                    bounds[2].max(layer.bounds[2]),
+                    bounds[3].max(layer.bounds[3]),
+                ],
+            });
+        }
+        final_layers.push(layer);
+    }
+    let bounds = combined_bounds.ok_or_else(|| {
+        invalid("the final PCB scene is empty after polarity and drill composition")
+    })?;
+    warnings.sort();
+    warnings.dedup();
+    Ok(PreparedSceneArtwork {
+        layers: final_layers,
+        previews: render_exposure_previews(&preview_grid),
+        bounds,
         warnings,
     })
 }
@@ -2225,6 +2551,50 @@ mod tests {
         let center_y = prepared.grid.height / 2;
         assert!(!prepared.grid.get(center_x, center_y));
         assert!(prepared.grid.get(center_x + 30, center_y));
+    }
+
+    #[test]
+    fn unified_scene_composes_independent_gerber_and_drill_objects() {
+        let gerber = fixture(
+            "board-B_Cu.gbr",
+            "%FSLAX24Y24*%\n%MOMM*%\n%ADD10R,10.0X6.0*%\nD10*\nX100000Y050000D03*\nM02*\n",
+        );
+        let drill = fixture(
+            "board-PTH.drl",
+            "M48\nMETRIC,000.000\nT01C1.000\n%\nT01\nX010000Y005000\nM30\n",
+        );
+        let legacy = small_config();
+        let config = slicer_config(&legacy);
+        let pcb = PcbObjectConfig {
+            exposure_s: legacy.exposure_s,
+            auto_mirror_front_layers: false,
+            invert: false,
+            invert_margin_mm: 0.0,
+            drill_mode: DrillMode::Clear,
+            simplify_tolerance_mm: legacy.simplify_tolerance_mm,
+        };
+        let gerber_object = SceneObjectConfig {
+            input: gerber.clone(),
+            source_type: SceneObjectType::Gerber,
+            visible: true,
+            transform: Transform::default(),
+            supports: SupportConfig::default(),
+            pcb: pcb.clone(),
+        };
+        let drill_object = SceneObjectConfig {
+            input: drill.clone(),
+            source_type: SceneObjectType::Drill,
+            visible: true,
+            transform: Transform::default(),
+            supports: SupportConfig::default(),
+            pcb,
+        };
+        let prepared = prepare_scene_artwork(&[&gerber_object, &drill_object], &config).unwrap();
+        std::fs::remove_file(gerber).unwrap();
+        std::fs::remove_file(drill).unwrap();
+        assert_eq!(prepared.layers.len(), 1);
+        assert_eq!(prepared.layers[0].contours.len(), 2);
+        assert!(prepared.layers[0].area() > 58.0 && prepared.layers[0].area() < 60.0);
     }
 
     #[test]

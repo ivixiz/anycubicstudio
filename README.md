@@ -640,17 +640,20 @@ directly. Enum strings use `snake_case`:
 This is only a fragment for explanation; `--config` expects the complete
 `SlicerConfig` produced by `slicer-default-config` or `--save-config`.
 
-### Multi-model project API
+### Unified scene project API
 
 The GUI serializes a public `SceneProject`: one global `SlicerConfig` plus an
-array of model paths, per-model transforms, and per-model support settings.
-Host programs may construct the same type directly:
+array of typed `SceneObjectConfig` values. Mesh, Gerber and drill objects share
+visibility and `Transform`; supports are consumed only by mesh objects and PCB
+properties only by Gerber/DRL objects. Host programs may construct the same
+type directly:
 
 ```rust
 use anycubicstudio::slicer::{
-    SceneModelConfig, SceneProject, SlicerConfig, SupportConfig, Transform,
-    slice_project,
+    SceneObjectConfig, SceneObjectType, SceneProject, SlicerConfig,
+    SupportConfig, Transform, slice_project,
 };
+use anycubicstudio::slicer::pcb::PcbObjectConfig;
 
 fn main() -> anycubicstudio::Result<()> {
     let mut left = Transform::default();
@@ -667,16 +670,22 @@ fn main() -> anycubicstudio::Result<()> {
 
     let project = SceneProject {
         config: SlicerConfig::default(),
-        models: vec![
-            SceneModelConfig {
+        objects: vec![
+            SceneObjectConfig {
                 input: "left.stl".into(),
+                source_type: SceneObjectType::Model,
+                visible: true,
                 transform: left,
                 supports: medium,
+                pcb: PcbObjectConfig::default(),
             },
-            SceneModelConfig {
+            SceneObjectConfig {
                 input: "right.step".into(),
+                source_type: SceneObjectType::Model,
+                visible: true,
                 transform: right,
                 supports: light,
+                pcb: PcbObjectConfig::default(),
             },
         ],
     };
@@ -693,9 +702,12 @@ target/release/anycubicstudio project-viewer-scene plate.json plate.acv
 target/release/anycubicstudio project-slice plate.json plate.pwsz
 ```
 
-Models must not geometrically overlap. The slicer combines their already
-positioned triangles before layer generation; the basic GUI `Auto layout`
-action is intended to establish that invariant.
+Mesh objects must not geometrically overlap. Gerber and Excellon objects retain
+one common source-coordinate frame, so KiCad drills align automatically, and
+then receive independent scene transforms. PCB contours and mesh/support
+contours are merged into one final layer stream. For a PCB-only job all PCB
+objects must use the same exposure time; in a mixed scene the global print
+profile controls exposure because a physical LCD layer cannot have two timings.
 
 The preset algorithm generates independent vertical tiered pillars. It is not
 yet Workshop's branched/tree-support engine. Always inspect contacts and sliced
