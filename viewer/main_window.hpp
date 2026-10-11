@@ -17,7 +17,9 @@ class QComboBox;
 class QDoubleSpinBox;
 class QDragEnterEvent;
 class QDropEvent;
+class QDockWidget;
 class QEvent;
+class QFormLayout;
 class QKeyEvent;
 class QLabel;
 class QLineEdit;
@@ -28,6 +30,7 @@ class QSpinBox;
 class QTabWidget;
 class QTimer;
 class PrintView;
+class SupportPreview;
 
 class MainWindow final : public QMainWindow {
 public:
@@ -35,6 +38,7 @@ public:
                         bool non_interactive = false);
     std::size_t importedObjectCount() const noexcept { return m_objects.size(); }
     bool runHistorySmokeTest(QString &error);
+    bool runSupportPreviewSmokeTest(QString &error);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -44,6 +48,11 @@ protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
+    struct NamedSupportPreset {
+        QString name;
+        SupportSettings settings;
+    };
+
     struct EditorSnapshot {
         std::vector<SceneObject> objects;
         SupportSettings default_supports;
@@ -60,6 +69,7 @@ private:
 
     void buildInterface();
     QWidget *buildCentre();
+    QWidget *buildLayersPanel();
     QWidget *buildTransformPanel();
     QWidget *buildSupportPanel();
     QWidget *buildPcbPanel();
@@ -76,12 +86,13 @@ private:
     void autoLayout();
     void selectionFromList();
     void selectionFromView(int index, Qt::KeyboardModifiers modifiers);
+    void selectionFromBox(const std::vector<int> &indices, Qt::KeyboardModifiers modifiers);
     std::vector<SceneObject *> selectedObjects();
     std::vector<const SceneObject *> selectedObjects() const;
     SceneObject *firstSelectedModel();
     SceneObject *firstSelectedArtwork();
     void refreshObjectList();
-    void refreshView();
+    void refreshView(bool reload_geometry = true);
     void refreshPropertyPanels();
     void loadTransformControls();
     void loadSupportControls();
@@ -94,18 +105,28 @@ private:
     void placeSelectionOnBed();
     void snapArtworkSelection();
     void applySupportPreset(int index);
+    void refreshSupportPresetCombo(const QString &selected_name = {});
+    void addSupportPreset();
+    void deleteCurrentSupportPreset();
+    void applySupportSettingsToControls(const SupportSettings &support);
+    void enforceSupportConstraints(QWidget *changed = nullptr);
+    void updateSupportControlVisibility();
+    void updateSupportPreview();
+    void syncSupportPreviewVisibility();
+    void showSupportPreviewFor(QWidget *editor);
+    QString supportPreviewLabel(QWidget *editor) const;
+    int supportPresetIndexFor(const SupportSettings &support) const;
     void addManualSupport();
     void removeManualSupport();
     void refreshManualSupports();
     void gizmoTransform(int mode, const QVector3D &delta);
     void transformVisual(SceneObject &object, int mode, const QVector3D &delta);
-    void scheduleRebuild();
-    void rebuildSelectedPreviews();
     void rebuildArtworkPreviews();
     bool rebuildObject(SceneObject &object, bool show_error = true);
 
     void updateLayerControls();
     void updateLayerLabel(int layer);
+    void exitSliceOverlay();
     void printingZoneChanged();
     void printSettingsChanged();
     void recordPrintSettingsHistory();
@@ -154,11 +175,13 @@ private:
     QWidget *m_transform_panel = nullptr;
     QWidget *m_support_panel = nullptr;
     QWidget *m_pcb_panel = nullptr;
-    QComboBox *m_view_mode = nullptr;
-    QCheckBox *m_show_model = nullptr;
-    QCheckBox *m_show_supports = nullptr;
+    QWidget *m_layer_controls = nullptr;
     QSlider *m_layer_slider = nullptr;
+    QSpinBox *m_layer_number = nullptr;
     QLabel *m_layer_label = nullptr;
+    QSlider *m_support_opacity = nullptr;
+    QSlider *m_model_opacity = nullptr;
+    QDockWidget *m_layer_dock = nullptr;
     QPlainTextEdit *m_log = nullptr;
 
     QDoubleSpinBox *m_move[3]{};
@@ -172,6 +195,7 @@ private:
     QComboBox *m_support_shape = nullptr;
     QDoubleSpinBox *m_support_angle = nullptr;
     QDoubleSpinBox *m_support_spacing = nullptr;
+    QDoubleSpinBox *m_support_density = nullptr;
     QDoubleSpinBox *m_support_tip = nullptr;
     QDoubleSpinBox *m_support_trunk = nullptr;
     QDoubleSpinBox *m_support_base = nullptr;
@@ -180,8 +204,14 @@ private:
     QDoubleSpinBox *m_support_penetration = nullptr;
     QDoubleSpinBox *m_support_min_height = nullptr;
     QDoubleSpinBox *m_support_max_height = nullptr;
+    QDoubleSpinBox *m_support_branch_max_distance = nullptr;
+    QSpinBox *m_support_branch_max_children = nullptr;
+    QDoubleSpinBox *m_support_branch_max_trunk = nullptr;
     QSpinBox *m_support_segments = nullptr;
     QListWidget *m_manual_supports = nullptr;
+    QFormLayout *m_support_form = nullptr;
+    SupportPreview *m_support_preview = nullptr;
+    std::vector<QWidget *> m_support_preview_controls;
 
     QDoubleSpinBox *m_pcb_exposure = nullptr;
     QComboBox *m_pcb_drill_mode = nullptr;
@@ -191,6 +221,8 @@ private:
     QLabel *m_pcb_status = nullptr;
 
     QDoubleSpinBox *m_zone[3]{};
+    QCheckBox *m_grid_snap = nullptr;
+    QDoubleSpinBox *m_snap_step = nullptr;
     QDoubleSpinBox *m_layer_height = nullptr;
     QSpinBox *m_bottom_layers = nullptr;
     QDoubleSpinBox *m_bottom_exposure = nullptr;
@@ -202,10 +234,13 @@ private:
 
     QLineEdit *m_cloud_config = nullptr;
     QLineEdit *m_printer_id = nullptr;
+    QLabel *m_connection_status = nullptr;
+    QPlainTextEdit *m_printer_response = nullptr;
     QLabel *m_cloud_file_label = nullptr;
     QComboBox *m_exposure_pattern = nullptr;
     QSpinBox *m_exposure_duration = nullptr;
 
+    QAction *m_import_action = nullptr;
     QAction *m_layout_action = nullptr;
     QAction *m_undo_action = nullptr;
     QAction *m_redo_action = nullptr;
@@ -215,14 +250,17 @@ private:
     QAction *m_resume_action = nullptr;
     QAction *m_stop_action = nullptr;
     QAction *m_status_action = nullptr;
-    QTimer *m_rebuild_timer = nullptr;
+    QAction *m_fit_action = nullptr;
     QTimer *m_history_timer = nullptr;
+    QTimer *m_layer_timer = nullptr;
 
     std::vector<std::unique_ptr<SceneObject>> m_objects;
+    std::vector<NamedSupportPreset> m_custom_support_presets;
     SupportSettings m_default_supports;
     PcbSettings m_default_pcb;
     QVector<LayerData> m_sliced_layers;
     QString m_last_pwsz;
+    QString m_slice_output_path;
     std::optional<qulonglong> m_cloud_file_id;
     bool m_last_job_is_pcb = false;
     double m_last_pcb_exposure = 0.0;
@@ -232,6 +270,8 @@ private:
     bool m_restoring_history = false;
     bool m_history_coalescing = false;
     bool m_gizmo_history_recorded = false;
+    bool m_slice_overlay_active = false;
+    int m_busy_depth = 0;
     std::vector<EditorSnapshot> m_undo_history;
     std::vector<EditorSnapshot> m_redo_history;
     std::array<double, 3> m_history_zone{};

@@ -1,4 +1,5 @@
 use super::mesh::{Mesh, Triangle, Vec3};
+use rayon::prelude::*;
 
 pub(crate) struct RenderedImage {
     pub width: u32,
@@ -17,51 +18,53 @@ struct CameraPreset {
     fill: f64,
 }
 
-pub(crate) fn render_previews(model: &Mesh, supports: &Mesh) -> Vec<RenderedImage> {
-    [
-        CameraPreset {
-            width: 224,
-            height: 168,
-            view: Vec3 {
-                x: 1.0,
-                y: -1.25,
-                z: 0.85,
+pub(crate) fn render_previews(model: &Mesh, supports: &Mesh) -> crate::Result<Vec<RenderedImage>> {
+    super::parallel::install(|| {
+        [
+            CameraPreset {
+                width: 224,
+                height: 168,
+                view: Vec3 {
+                    x: 1.0,
+                    y: -1.25,
+                    z: 0.85,
+                },
+                background: [2, 72, 100, 255],
+                model: [45, 190, 186],
+                support: [28, 91, 205],
+                fill: 0.68,
             },
-            background: [2, 72, 100, 255],
-            model: [45, 190, 186],
-            support: [28, 91, 205],
-            fill: 0.68,
-        },
-        CameraPreset {
-            width: 336,
-            height: 252,
-            view: Vec3 {
-                x: 0.15,
-                y: -1.0,
-                z: 0.18,
+            CameraPreset {
+                width: 336,
+                height: 252,
+                view: Vec3 {
+                    x: 0.15,
+                    y: -1.0,
+                    z: 0.18,
+                },
+                background: [20, 27, 41, 255],
+                model: [38, 172, 168],
+                support: [37, 91, 205],
+                fill: 0.66,
             },
-            background: [20, 27, 41, 255],
-            model: [38, 172, 168],
-            support: [37, 91, 205],
-            fill: 0.66,
-        },
-        CameraPreset {
-            width: 800,
-            height: 600,
-            view: Vec3 {
-                x: 1.0,
-                y: -1.25,
-                z: 0.72,
+            CameraPreset {
+                width: 800,
+                height: 600,
+                view: Vec3 {
+                    x: 1.0,
+                    y: -1.25,
+                    z: 0.72,
+                },
+                background: [238, 240, 246, 255],
+                model: [45, 190, 186],
+                support: [40, 98, 214],
+                fill: 0.82,
             },
-            background: [238, 240, 246, 255],
-            model: [45, 190, 186],
-            support: [40, 98, 214],
-            fill: 0.82,
-        },
-    ]
-    .into_iter()
-    .map(|camera| render(model, supports, camera))
-    .collect()
+        ]
+        .into_par_iter()
+        .map(|camera| render(model, supports, camera))
+        .collect()
+    })
 }
 
 fn render(model: &Mesh, supports: &Mesh, camera: CameraPreset) -> RenderedImage {
@@ -289,7 +292,8 @@ mod tests {
             &Mesh {
                 triangles: Vec::new(),
             },
-        );
+        )
+        .unwrap();
         assert_eq!(previews[0].rgba.len(), 224 * 168 * 4);
         assert_eq!(previews[1].rgba.len(), 336 * 252 * 4);
         assert_eq!(previews[2].rgba.len(), 800 * 600 * 4);

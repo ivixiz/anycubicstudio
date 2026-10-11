@@ -1,0 +1,18 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="abort.png">icons/abort_512x512_noBG.png</file>
+        <file alias="redo.png">icons/editRedo_512x512_noBG.png</file>
+        <file alias="undo.png">icons/editUndo_512x512_noBG.png</file>
+        <file alias="scale.png">icons/featureScale_512x512_noBG.png</file>
+        <file alias="move.png">icons/move_512x512_noBG.png</file>
+        <file alias="pause.png">icons/pause_512x512_noBG.png</file>
+        <file alias="status.png">icons/printerStatus_512x512_noBG.png</file>
+        <file alias="resume.png">icons/resume_512x512_noBG.png</file>
+        <file alias="run.png">icons/run_512x512_noBG.png</file>
+        <file alias="slice.png">icons/slice_512x512_noBG.png</file>
+        <file alias="fit.png">icons/zoomToFit_512x512_noBG.png</file>
+        <file alias="import.png">icons/import_512x512_noBG.png</file>
+        <file alias="rotate.png">icons/rotate_512x512_noBG.png</file>
+        <file alias="layout.png">icons/autoLayout_512x512_noBG.png</file>
+    </qresource>
+</RCC>

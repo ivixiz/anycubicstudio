@@ -4,6 +4,7 @@ project(anycubic_viewer LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets OpenGL OpenGLWidgets)
 
@@ -14,7 +15,10 @@ qt_add_executable(anycubic-viewer
     print_view.cpp
     print_view.hpp
     scene.cpp
-    scene.hpp)
+    scene.hpp
+    support_preview.cpp
+    support_preview.hpp
+    icons.qrc)
 target_link_libraries(anycubic-viewer PRIVATE
     Qt6::Widgets
     Qt6::OpenGL

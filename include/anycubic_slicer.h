@@ -23,9 +23,10 @@ typedef struct AnycubicSlicerConfig {
     uint8_t supports_enabled;
     uint8_t supports_auto_generate;
     uint8_t hollow;
-    uint32_t support_shape; /* 0 cylinder, 1 tapered, 2 square */
+    uint32_t support_shape; /* 0 cylinder, 1 tapered, 2 square, 3 branch */
     double support_overhang_angle_deg;
     double support_spacing_mm;
+    double support_density_per_cm2;
     double support_tip_diameter_mm;
     double support_trunk_diameter_mm;
     double support_base_diameter_mm;
@@ -34,6 +35,9 @@ typedef struct AnycubicSlicerConfig {
     double support_penetration_mm;
     double support_min_height_mm;
     double support_max_height_mm;
+    double support_branch_max_distance_mm;
+    uint32_t support_branch_max_children;
+    double support_branch_max_trunk_diameter_mm;
     uint32_t support_radial_segments;
     double xy_offset_mm;
 } AnycubicSlicerConfig;

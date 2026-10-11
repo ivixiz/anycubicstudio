@@ -33,6 +33,7 @@ pub struct AnycubicSlicerConfig {
     pub support_shape: u32,
     pub support_overhang_angle_deg: f64,
     pub support_spacing_mm: f64,
+    pub support_density_per_cm2: f64,
     pub support_tip_diameter_mm: f64,
     pub support_trunk_diameter_mm: f64,
     pub support_base_diameter_mm: f64,
@@ -41,6 +42,9 @@ pub struct AnycubicSlicerConfig {
     pub support_penetration_mm: f64,
     pub support_min_height_mm: f64,
     pub support_max_height_mm: f64,
+    pub support_branch_max_distance_mm: f64,
+    pub support_branch_max_children: u32,
+    pub support_branch_max_trunk_diameter_mm: f64,
     pub support_radial_segments: u32,
     pub xy_offset_mm: f64,
 }
@@ -78,12 +82,14 @@ impl From<&SlicerConfig> for AnycubicSlicerConfig {
             supports_auto_generate: u8::from(config.supports.auto_generate),
             hollow: u8::from(config.hollow),
             support_shape: match config.supports.shape {
+                SupportShape::Branch => 3,
                 SupportShape::Cylinder => 0,
                 SupportShape::Tapered => 1,
                 SupportShape::Square => 2,
             },
             support_overhang_angle_deg: config.supports.overhang_angle_deg,
             support_spacing_mm: config.supports.spacing_mm,
+            support_density_per_cm2: config.supports.density_per_cm2,
             support_tip_diameter_mm: config.supports.tip_diameter_mm,
             support_trunk_diameter_mm: config.supports.trunk_diameter_mm,
             support_base_diameter_mm: config.supports.base_diameter_mm,
@@ -92,6 +98,9 @@ impl From<&SlicerConfig> for AnycubicSlicerConfig {
             support_penetration_mm: config.supports.penetration_mm,
             support_min_height_mm: config.supports.min_height_mm,
             support_max_height_mm: config.supports.max_height_mm,
+            support_branch_max_distance_mm: config.supports.branch_max_distance_mm,
+            support_branch_max_children: config.supports.branch_max_children,
+            support_branch_max_trunk_diameter_mm: config.supports.branch_max_trunk_diameter_mm,
             support_radial_segments: config.supports.radial_segments,
             xy_offset_mm: config.xy_offset_mm,
         }
@@ -118,10 +127,12 @@ impl From<AnycubicSlicerConfig> for SlicerConfig {
         result.supports.shape = match config.support_shape {
             0 => SupportShape::Cylinder,
             2 => SupportShape::Square,
+            3 => SupportShape::Branch,
             _ => SupportShape::Tapered,
         };
         result.supports.overhang_angle_deg = config.support_overhang_angle_deg;
         result.supports.spacing_mm = config.support_spacing_mm;
+        result.supports.density_per_cm2 = config.support_density_per_cm2;
         result.supports.tip_diameter_mm = config.support_tip_diameter_mm;
         result.supports.trunk_diameter_mm = config.support_trunk_diameter_mm;
         result.supports.base_diameter_mm = config.support_base_diameter_mm;
@@ -130,6 +141,9 @@ impl From<AnycubicSlicerConfig> for SlicerConfig {
         result.supports.penetration_mm = config.support_penetration_mm;
         result.supports.min_height_mm = config.support_min_height_mm;
         result.supports.max_height_mm = config.support_max_height_mm;
+        result.supports.branch_max_distance_mm = config.support_branch_max_distance_mm;
+        result.supports.branch_max_children = config.support_branch_max_children;
+        result.supports.branch_max_trunk_diameter_mm = config.support_branch_max_trunk_diameter_mm;
         result.supports.radial_segments = config.support_radial_segments;
         result.hollow = config.hollow != 0;
         result.xy_offset_mm = config.xy_offset_mm;
@@ -212,8 +226,10 @@ pub unsafe extern "C" fn anycubic_slicer_slice_with_supports(
     // SAFETY: the non-null pointer must reference a properly initialized
     // AnycubicSlicerConfig according to the exported C contract.
     let raw_config = unsafe { configuration.read() };
-    if raw_config.support_shape > 2 {
-        set_last_error("support_shape must be 0 (cylinder), 1 (tapered), or 2 (square)");
+    if raw_config.support_shape > 3 {
+        set_last_error(
+            "support_shape must be 0 (cylinder), 1 (tapered), 2 (square), or 3 (branch)",
+        );
         return -1;
     }
     let mut config = SlicerConfig::from(raw_config);

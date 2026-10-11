@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use rayon::prelude::*;
+use smallvec::SmallVec;
+
 use crate::{Error, Result};
 
 use super::mesh::{Mesh, Triangle};
@@ -40,6 +43,48 @@ pub(crate) fn slice_mesh(
     layer_height: f64,
     stitch_tolerance_mm: f64,
     maximum_gap_mm: f64,
+) -> Result<Vec<LayerSlice>> {
+    slice_mesh_with_orientation(
+        mesh,
+        layer_height,
+        stitch_tolerance_mm,
+        maximum_gap_mm,
+        ContourOrientation::Nested,
+    )
+}
+
+/// Slices generated support primitives as a positive union. Supports are made
+/// from overlapping closed cylinders/cones/branches and do not contain
+/// intentional cavities. Treating a contour that happens to lie inside a
+/// neighbouring primitive as a model hole creates layer-dependent pinholes at
+/// branch joints.
+pub(crate) fn slice_support_mesh(
+    mesh: &Mesh,
+    layer_height: f64,
+    stitch_tolerance_mm: f64,
+    maximum_gap_mm: f64,
+) -> Result<Vec<LayerSlice>> {
+    slice_mesh_with_orientation(
+        mesh,
+        layer_height,
+        stitch_tolerance_mm,
+        maximum_gap_mm,
+        ContourOrientation::PositiveUnion,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ContourOrientation {
+    Nested,
+    PositiveUnion,
+}
+
+fn slice_mesh_with_orientation(
+    mesh: &Mesh,
+    layer_height: f64,
+    stitch_tolerance_mm: f64,
+    maximum_gap_mm: f64,
+    orientation: ContourOrientation,
 ) -> Result<Vec<LayerSlice>> {
     if !layer_height.is_finite() || layer_height <= 0.0 {
         return Err(Error::InvalidModel(
@@ -96,55 +141,85 @@ pub(crate) fn slice_mesh(
         }
     }
 
-    bins.into_iter()
-        .enumerate()
-        .map(|(index, candidates)| {
-            let z = (index as f64 + 0.5) * layer_height;
-            // A mathematical section exactly through a mesh vertex or a
-            // coplanar triangle edge is ambiguous and can omit one incident
-            // segment. Select the infinitesimally higher side consistently;
-            // this is several orders below an LCD pixel and does not relax
-            // contour validation.
-            let section_z = z + stitch_tolerance_mm * 1.0e-4;
-            let raw_segments = candidates
-                .into_iter()
-                .filter_map(|triangle| intersect_triangle(mesh.triangles[triangle], section_z))
-                .collect::<Vec<_>>();
-            let mut contours = stitch_segments(&raw_segments, stitch_tolerance_mm, maximum_gap_mm)
-                .map_err(|message| {
-                    Error::InvalidModel(format!("layer {index} at z={z:.6} mm: {message}"))
-                })?;
-            orient_contours(&mut contours);
-            Ok(prepare_layer(index as u32, z, contours))
-        })
-        .collect()
+    super::parallel::install(|| {
+        bins.into_par_iter()
+            .enumerate()
+            .map(|(index, candidates)| {
+                let z = (index as f64 + 0.5) * layer_height;
+                // A mathematical section exactly through a mesh vertex or a
+                // coplanar triangle edge is ambiguous and can omit one incident
+                // segment. Select the infinitesimally higher side consistently;
+                // this is several orders below an LCD pixel and does not relax
+                // contour validation.
+                let section_z = z + stitch_tolerance_mm * 1.0e-4;
+                let raw_segments = candidates
+                    .into_iter()
+                    .filter_map(|triangle| intersect_triangle(mesh.triangles[triangle], section_z))
+                    .collect::<Vec<_>>();
+                let mut contours =
+                    stitch_segments(&raw_segments, stitch_tolerance_mm, maximum_gap_mm).map_err(
+                        |message| {
+                            Error::InvalidModel(format!("layer {index} at z={z:.6} mm: {message}"))
+                        },
+                    )?;
+                match orientation {
+                    ContourOrientation::Nested => orient_contours(&mut contours),
+                    ContourOrientation::PositiveUnion => orient_positive(&mut contours),
+                }
+                Ok(prepare_layer(index as u32, z, contours))
+            })
+            .collect()
+    })?
 }
 
 /// Combines independently oriented model/support contours. Keeping the two
 /// winding classifications separate prevents a support inside the model's XY
 /// projection from being mistaken for a hole.
 pub(crate) fn merge_layers(
-    model: &[LayerSlice],
-    supports: &[LayerSlice],
+    model: Vec<LayerSlice>,
+    supports: Vec<LayerSlice>,
     layer_height: f64,
-) -> Vec<LayerSlice> {
+) -> Result<Vec<LayerSlice>> {
     let count = model.len().max(supports.len());
-    (0..count)
-        .map(|index| {
-            let mut contours = Vec::new();
-            if let Some(layer) = model.get(index) {
-                contours.extend(layer.contours.iter().cloned());
-            }
-            if let Some(layer) = supports.get(index) {
-                contours.extend(layer.contours.iter().cloned());
-            }
-            prepare_layer(index as u32, (index as f64 + 0.5) * layer_height, contours)
-        })
-        .collect()
+    if model.is_empty() {
+        return Ok(supports);
+    }
+    if supports.is_empty() {
+        return Ok(model);
+    }
+    let mut model = model.into_iter();
+    let mut supports = supports.into_iter();
+    // Move polygon storage instead of retaining two complete copies of the
+    // layer stream during merging. The encoded segments are rebuilt in place.
+    let pairs = (0..count)
+        .map(|i| (i, model.next(), supports.next()))
+        .collect::<Vec<_>>();
+    super::parallel::install(|| {
+        pairs
+            .into_par_iter()
+            .map(|(index, model, support)| match (model, support) {
+                (Some(mut model), Some(support)) => {
+                    model.contours.extend(support.contours);
+                    drop(model.segments);
+                    drop(support.segments);
+                    prepare_layer(
+                        index as u32,
+                        (index as f64 + 0.5) * layer_height,
+                        model.contours,
+                    )
+                }
+                (Some(layer), None) | (None, Some(layer)) => layer,
+                (None, None) => unreachable!("layer count is the maximum input length"),
+            })
+            .collect()
+    })
 }
 
 fn intersect_triangle(triangle: Triangle, z: f64) -> Option<[Vec2; 2]> {
-    let mut intersections = Vec::<Vec2>::with_capacity(3);
+    // A plane intersects a triangle in at most two unique edge crossings.
+    // Keep the original arithmetic/order without a heap allocation per test.
+    let mut intersections = [Vec2::default(); 3];
+    let mut count = 0;
     for edge in [[0, 1], [1, 2], [2, 0]] {
         let first = triangle.0[edge[0]];
         let second = triangle.0[edge[1]];
@@ -160,14 +235,15 @@ fn intersect_triangle(triangle: Triangle, z: f64) -> Option<[Vec2; 2]> {
             x: first.x + (second.x - first.x) * ratio,
             y: first.y + (second.y - first.y) * ratio,
         };
-        if !intersections
+        if !intersections[..count]
             .iter()
             .any(|existing| distance_squared(*existing, point) < MIN_SEGMENT_LENGTH_SQUARED)
         {
-            intersections.push(point);
+            intersections[count] = point;
+            count += 1;
         }
     }
-    if intersections.len() != 2
+    if count != 2
         || distance_squared(intersections[0], intersections[1]) < MIN_SEGMENT_LENGTH_SQUARED
     {
         None
@@ -194,8 +270,8 @@ fn stitch_segments(
     maximum_gap: f64,
 ) -> std::result::Result<Vec<Vec<Vec2>>, String> {
     let tolerance_squared = tolerance * tolerance;
-    let mut nodes = Vec::<Vec2>::new();
-    let mut cells = HashMap::<GridCell, Vec<usize>>::new();
+    let mut nodes = Vec::<Vec2>::with_capacity(segments.len());
+    let mut cells = HashMap::<GridCell, SmallVec<[usize; 2]>>::with_capacity(segments.len());
     let mut endpoint_nodes = Vec::<[usize; 2]>::with_capacity(segments.len());
     for segment in segments {
         let mut endpoints = [0_usize; 2];
@@ -231,10 +307,11 @@ fn stitch_segments(
     // same topological edge. If the first resolution-sized clustering leaves
     // nearby odd-degree endpoint pairs within the caller's source-aware limit,
     // merge that pair explicitly. Larger holes remain fatal errors.
-    heal_odd_nodes(&mut nodes, &mut endpoint_nodes, maximum_gap);
-
-    let edges = parity_edges(&endpoint_nodes);
-    let mut adjacency = vec![Vec::<usize>::new(); nodes.len()];
+    let mut edges = parity_edges(&endpoint_nodes);
+    if heal_odd_nodes(&mut nodes, &mut endpoint_nodes, &edges, maximum_gap) {
+        edges = parity_edges(&endpoint_nodes);
+    }
+    let mut adjacency = vec![SmallVec::<[usize; 2]>::new(); nodes.len()];
     for (edge, [first, second]) in edges.iter().copied().enumerate() {
         adjacency[first].push(edge);
         adjacency[second].push(edge);
@@ -319,15 +396,23 @@ fn stitch_segments(
         }
         remove_duplicate_neighbours(&mut contour, tolerance_squared);
         if contour.len() >= 3 && twice_area(&contour).abs() > 1.0e-12 {
+            // These polygons live until ZIP/ACV export; release growth slack
+            // once, instead of keeping up to 2x capacity across all layers.
+            contour.shrink_to_fit();
             contours.push(contour);
         }
     }
     Ok(contours)
 }
 
-fn heal_odd_nodes(nodes: &mut [Vec2], endpoint_nodes: &mut [[usize; 2]], maximum_distance: f64) {
+fn heal_odd_nodes(
+    nodes: &mut [Vec2],
+    endpoint_nodes: &mut [[usize; 2]],
+    edges: &[[usize; 2]],
+    maximum_distance: f64,
+) -> bool {
     let mut degree = vec![0_usize; nodes.len()];
-    for [first, second] in parity_edges(endpoint_nodes) {
+    for &[first, second] in edges {
         degree[first] += 1;
         degree[second] += 1;
     }
@@ -350,12 +435,14 @@ fn heal_odd_nodes(nodes: &mut [Vec2], endpoint_nodes: &mut [[usize; 2]], maximum
     // a cluster of three or four independently tessellated CAD face seams.
     candidates.sort_by(|left, right| left.0.total_cmp(&right.0));
     let mut paired = vec![false; nodes.len()];
+    let mut changed = false;
     for (_, node, candidate) in candidates {
         if paired[node] || paired[candidate] {
             continue;
         }
         paired[node] = true;
         paired[candidate] = true;
+        changed = true;
         nodes[node] = Vec2 {
             x: (nodes[node].x + nodes[candidate].x) * 0.5,
             y: (nodes[node].y + nodes[candidate].y) * 0.5,
@@ -368,13 +455,15 @@ fn heal_odd_nodes(nodes: &mut [Vec2], endpoint_nodes: &mut [[usize; 2]], maximum
             }
         }
     }
+    changed
 }
 
 /// Coincident triangle/shell faces contribute the same intersection segment
 /// twice. Contour boundaries are an XOR: an even multiplicity is internal and
 /// disappears, while an odd multiplicity contributes one edge.
 fn parity_edges(endpoint_nodes: &[[usize; 2]]) -> Vec<[usize; 2]> {
-    let mut odd = HashMap::<(usize, usize), [usize; 2]>::new();
+    let mut positions = HashMap::<(usize, usize), usize>::with_capacity(endpoint_nodes.len());
+    let mut odd = Vec::<Option<[usize; 2]>>::with_capacity(endpoint_nodes.len());
     for [first, second] in endpoint_nodes.iter().copied() {
         if first == second {
             continue;
@@ -384,11 +473,24 @@ fn parity_edges(endpoint_nodes: &[[usize; 2]]) -> Vec<[usize; 2]> {
         } else {
             (second, first)
         };
-        if odd.remove(&key).is_none() {
-            odd.insert(key, [first, second]);
+        match positions.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(odd.len());
+                odd.push(Some([first, second]));
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let edge = &mut odd[*entry.get()];
+                *edge = if edge.is_some() {
+                    None
+                } else {
+                    Some([first, second])
+                };
+            }
         }
     }
-    odd.into_values().collect()
+    // Stable source order keeps contour traversal and vertex deduplication
+    // independent of hash seeds and worker scheduling.
+    odd.into_iter().flatten().collect()
 }
 
 fn continuation_score(incoming: Vec2, current: usize, edge: [usize; 2], nodes: &[Vec2]) -> f64 {
@@ -416,16 +518,51 @@ fn remove_duplicate_neighbours(contour: &mut Vec<Vec2>, tolerance_squared: f64) 
 }
 
 fn orient_contours(contours: &mut [Vec<Vec2>]) {
-    let original = contours.to_vec();
-    for (index, contour) in contours.iter_mut().enumerate() {
-        let probe = original[index][0];
-        let depth = original
-            .iter()
-            .enumerate()
-            .filter(|(other, polygon)| *other != index && point_in_polygon(probe, polygon))
-            .count();
-        let should_be_counter_clockwise = depth % 2 == 0;
+    let bounds = contours
+        .iter()
+        .map(|contour| {
+            contour.iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |b, p| [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)],
+            )
+        })
+        .collect::<Vec<_>>();
+    let winding = contours
+        .iter()
+        .enumerate()
+        .map(|(index, contour)| {
+            let probe = contour[0];
+            let depth = contours
+                .iter()
+                .enumerate()
+                .filter(|(other, polygon)| {
+                    let b = bounds[*other];
+                    *other != index
+                        && probe.x >= b[0]
+                        && probe.x <= b[2]
+                        && probe.y >= b[1]
+                        && probe.y <= b[3]
+                        && point_in_polygon(probe, polygon)
+                })
+                .count();
+            depth % 2 == 0
+        })
+        .collect::<Vec<_>>();
+    for (contour, should_be_counter_clockwise) in contours.iter_mut().zip(winding) {
         if (twice_area(contour) > 0.0) != should_be_counter_clockwise {
+            contour.reverse();
+        }
+    }
+}
+
+fn orient_positive(contours: &mut [Vec<Vec2>]) {
+    for contour in contours {
+        if twice_area(contour) < 0.0 {
             contour.reverse();
         }
     }
@@ -541,6 +678,18 @@ mod tests {
         Mesh { triangles }
     }
 
+    fn scaled_translated_cube(scale: f64, offset: Vec3) -> Mesh {
+        let mut result = cube();
+        for triangle in &mut result.triangles {
+            for point in &mut triangle.0 {
+                point.x = point.x * scale + offset.x;
+                point.y = point.y * scale + offset.y;
+                point.z = point.z * scale + offset.z;
+            }
+        }
+        result
+    }
+
     #[test]
     fn slices_cube_at_layer_midpoints() {
         let layers = slice_mesh(&cube(), 0.25, 1.0e-5, 5.0e-5).unwrap();
@@ -550,6 +699,36 @@ mod tests {
             assert!((layer.area() - 1.0).abs() < 1.0e-9);
             assert_eq!(layer.segments.len(), 8); // STL face diagonals remain as collinear edges.
         }
+    }
+
+    #[test]
+    fn nested_support_solids_remain_positive_instead_of_becoming_holes() {
+        let mut supports = scaled_translated_cube(2.0, Vec3::default());
+        supports.triangles.extend(
+            scaled_translated_cube(
+                1.0,
+                Vec3 {
+                    x: 0.5,
+                    y: 0.5,
+                    z: 0.0,
+                },
+            )
+            .triangles,
+        );
+
+        let model_layer = &slice_mesh(&supports, 0.25, 1.0e-5, 5.0e-5).unwrap()[0];
+        assert_eq!(model_layer.contours.len(), 2);
+        assert!((model_layer.area() - 3.0).abs() < 1.0e-9);
+
+        let support_layer = &slice_support_mesh(&supports, 0.25, 1.0e-5, 5.0e-5).unwrap()[0];
+        assert_eq!(support_layer.contours.len(), 2);
+        assert!(
+            support_layer
+                .contours
+                .iter()
+                .all(|contour| twice_area(contour) > 0.0)
+        );
+        assert!((support_layer.area() - 5.0).abs() < 1.0e-9);
     }
 
     #[test]
@@ -565,5 +744,23 @@ mod tests {
             1
         );
         assert!(stitch_segments(&almost_closed, 0.0001, 0.0005).is_err());
+    }
+
+    #[test]
+    fn heals_an_exporter_crack_only_inside_the_explicit_gap_limit() {
+        let exporter_crack = [
+            [Vec2 { x: 0.0, y: 0.0 }, Vec2 { x: 1.0, y: 0.0 }],
+            [Vec2 { x: 1.086, y: 0.0 }, Vec2 { x: 1.0, y: 1.0 }],
+            [Vec2 { x: 1.0, y: 1.0 }, Vec2 { x: 0.0, y: 1.0 }],
+            [Vec2 { x: 0.0, y: 1.0 }, Vec2 { x: 0.0, y: 0.0 }],
+        ];
+        let lcd_pixel = 0.0168;
+        assert!(stitch_segments(&exporter_crack, lcd_pixel, lcd_pixel * 5.0).is_err());
+        assert_eq!(
+            stitch_segments(&exporter_crack, lcd_pixel, lcd_pixel * 8.0)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

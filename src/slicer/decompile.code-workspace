@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../../../../C/grblaser"
+		},
+		{
+			"path": "../../../../C/OrcaSlicer"
 		}
 	],
 	"settings": {}

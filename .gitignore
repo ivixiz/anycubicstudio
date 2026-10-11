@@ -1,6 +1,6 @@
 /target
 /viewer/build/
-
+/test
 # Account bearer credentials.  The client can read Workshop's file in place;
 # never copy it into the repository.
 global_config.ini
@@ -10,4 +10,4 @@ global_config.ini
 secrets/
 enviroment.ini
 example.pwsz
-./test
+

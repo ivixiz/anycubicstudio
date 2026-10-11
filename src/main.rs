@@ -39,7 +39,11 @@ async fn main() -> anyhow::Result<()> {
     }
     if matches!(
         host.as_deref(),
-        Some("project-slice") | Some("project-viewer-scene") | Some("project-object-viewer-scene")
+        Some("project-slice")
+            | Some("project-slice-with-viewer")
+            | Some("project-viewer-scene")
+            | Some("project-object-viewer-scene")
+            | Some("project-model-viewer-scene")
     ) {
         let operation = host.as_deref().expect("matched project operation");
         let project_path = arguments.next().ok_or_else(|| {
@@ -47,7 +51,10 @@ async fn main() -> anyhow::Result<()> {
                 "usage: anycubicstudio {operation} <PROJECT.json> [OBJECT_INDEX] <OUTPUT>"
             )
         })?;
-        let object_index = if operation == "project-object-viewer-scene" {
+        let object_index = if matches!(
+            operation,
+            "project-object-viewer-scene" | "project-model-viewer-scene"
+        ) {
             Some(
                 arguments
                     .next()
@@ -60,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
         let output = arguments
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing project output path"))?;
+        let viewer_output = if operation == "project-slice-with-viewer" {
+            Some(
+                arguments
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("missing viewer output path"))?,
+            )
+        } else {
+            None
+        };
         if arguments.next().is_some() {
             return Err(anyhow::anyhow!(
                 "usage: anycubicstudio {operation} <PROJECT.json> <OUTPUT>"
@@ -77,9 +93,33 @@ async fn main() -> anyhow::Result<()> {
                 report.estimated_volume_ml,
                 report.output_bytes,
             );
+        } else if operation == "project-slice-with-viewer" {
+            let (report, viewer) = anycubicstudio::slicer::slice_project_with_viewer(
+                &project,
+                output,
+                viewer_output.expect("validated viewer output"),
+            )?;
+            println!(
+                "Created project PWSZ and viewer scene: {} model + {} support triangles ({} supports), {} layers, {:.3} ml, {} + {} bytes",
+                report.model_triangle_count,
+                report.support_triangle_count,
+                report.support_count,
+                report.layer_count,
+                report.estimated_volume_ml,
+                report.output_bytes,
+                viewer.output_bytes,
+            );
         } else {
             let report = if let Some(index) = object_index {
-                anycubicstudio::slicer::export_project_object_viewer_scene(&project, index, output)?
+                if operation == "project-model-viewer-scene" {
+                    anycubicstudio::slicer::export_project_model_viewer_scene(
+                        &project, index, output,
+                    )?
+                } else {
+                    anycubicstudio::slicer::export_project_object_viewer_scene(
+                        &project, index, output,
+                    )?
+                }
             } else {
                 anycubicstudio::slicer::export_project_viewer_scene(&project, output)?
             };
@@ -770,12 +810,13 @@ fn parse_slice_arguments(
             }
             "--support-shape" => {
                 config.supports.shape = match value(&mut arguments)?.as_str() {
+                    "branch" | "tree" => SupportShape::Branch,
                     "cylinder" => SupportShape::Cylinder,
                     "tapered" => SupportShape::Tapered,
                     "square" => SupportShape::Square,
                     shape => {
                         return Err(anyhow::anyhow!(
-                            "unknown support shape {shape}; expected cylinder, tapered or square"
+                            "unknown support shape {shape}; expected branch, cylinder, tapered or square"
                         ));
                     }
                 };
@@ -792,6 +833,9 @@ fn parse_slice_arguments(
                 };
             }
             "--support-spacing" => config.supports.spacing_mm = value(&mut arguments)?.parse()?,
+            "--support-density" => {
+                config.supports.density_per_cm2 = value(&mut arguments)?.parse()?
+            }
             "--support-angle" => {
                 config.supports.overhang_angle_deg = value(&mut arguments)?.parse()?
             }
@@ -819,6 +863,15 @@ fn parse_slice_arguments(
             }
             "--support-segments" => {
                 config.supports.radial_segments = value(&mut arguments)?.parse()?
+            }
+            "--support-branch-max-distance" => {
+                config.supports.branch_max_distance_mm = value(&mut arguments)?.parse()?
+            }
+            "--support-branch-max-children" => {
+                config.supports.branch_max_children = value(&mut arguments)?.parse()?
+            }
+            "--support-branch-max-trunk" => {
+                config.supports.branch_max_trunk_diameter_mm = value(&mut arguments)?.parse()?
             }
             "--manual-support" => {
                 let coordinates = parse_numbers(&value(&mut arguments)?, 3, 4)?;
@@ -968,7 +1021,7 @@ fn parse_numbers(value: &str, minimum: usize, maximum: usize) -> anyhow::Result<
 }
 
 fn slice_usage() -> &'static str {
-    "usage: anycubicstudio slice <MODEL> <OUTPUT.pwsz> [--config FILE] [--save-config FILE] [--supports none|light|medium|heavy] [--support-auto on|off] [--support-shape cylinder|tapered|square] [--support-spacing MM] [--support-angle DEG] [--support-tip MM] [--support-trunk MM] [--support-base MM] [--support-tip-height MM] [--support-base-height MM] [--support-penetration MM] [--support-min-height MM] [--support-max-height MM] [--support-segments N] [--manual-support X,Y,Z[,BASE_Z]] [--layer-height MM] [--bottom-layers N] [--bottom-exposure SEC] [--exposure SEC] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z] [--move X,Y,Z] [--rotate X,Y,Z] [--scale X,Y,Z] [--no-center] [--no-place-on-bed]"
+    "usage: anycubicstudio slice <MODEL> <OUTPUT.pwsz> [--config FILE] [--save-config FILE] [--supports none|light|medium|heavy] [--support-auto on|off] [--support-shape branch|cylinder|tapered|square] [--support-spacing MM] [--support-density N_PER_CM2] [--support-angle DEG] [--support-tip MM] [--support-trunk MM] [--support-base MM] [--support-tip-height MM] [--support-base-height MM] [--support-penetration MM] [--support-min-height MM] [--support-max-height MM] [--support-branch-max-distance MM] [--support-branch-max-children N] [--support-branch-max-trunk MM] [--support-segments N] [--manual-support X,Y,Z[,BASE_Z]] [--layer-height MM] [--bottom-layers N] [--bottom-exposure SEC] [--exposure SEC] [--lift-height MM] [--lift-speed MM_S] [--build-volume X,Y,Z] [--move X,Y,Z] [--rotate X,Y,Z] [--scale X,Y,Z] [--no-center] [--no-place-on-bed]"
 }
 
 fn pcb_usage(operation: &str) -> String {

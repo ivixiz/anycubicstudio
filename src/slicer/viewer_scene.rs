@@ -1,4 +1,8 @@
-use std::{fs::File, io::Write, path::Path};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
 use crate::Result;
 
@@ -14,7 +18,8 @@ pub(crate) fn write_viewer_scene(
     supports: &Mesh,
     layers: &[LayerSlice],
 ) -> Result<()> {
-    let mut file = File::create(output)?;
+    let mut timings = super::timing::Timings::new("ACV");
+    let mut file = BufWriter::with_capacity(1024 * 1024, File::create(output)?);
     file.write_all(b"ACVSCN1\0")?;
     write_u32(&mut file, 1)?;
     for size in config.machine.build_volume_mm {
@@ -42,13 +47,14 @@ pub(crate) fn write_viewer_scene(
         }
     }
     file.flush()?;
+    timings.lap("buffered scene export");
     Ok(())
 }
 
-fn write_u32(file: &mut File, value: u32) -> std::io::Result<()> {
+fn write_u32(file: &mut impl Write, value: u32) -> std::io::Result<()> {
     file.write_all(&value.to_le_bytes())
 }
 
-fn write_f32(file: &mut File, value: f32) -> std::io::Result<()> {
+fn write_f32(file: &mut impl Write, value: f32) -> std::io::Result<()> {
     file.write_all(&value.to_le_bytes())
 }

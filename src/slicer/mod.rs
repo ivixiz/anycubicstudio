@@ -7,9 +7,12 @@
 mod ffi;
 mod geometry;
 mod mesh;
+mod parallel;
 pub mod pcb;
 mod render;
+mod spatial;
 mod support;
+mod timing;
 mod viewer_scene;
 mod writer;
 
@@ -109,6 +112,7 @@ impl Default for Transform {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SupportShape {
+    Branch,
     Cylinder,
     Tapered,
     Square,
@@ -129,6 +133,10 @@ pub struct SupportConfig {
     pub shape: SupportShape,
     pub overhang_angle_deg: f64,
     pub spacing_mm: f64,
+    /// Upper bound for automatically sampled contacts per square centimetre.
+    /// Together with `spacing_mm`, the less dense constraint wins.
+    #[serde(default = "default_support_density_per_cm2")]
+    pub density_per_cm2: f64,
     pub tip_diameter_mm: f64,
     pub trunk_diameter_mm: f64,
     pub base_diameter_mm: f64,
@@ -137,9 +145,35 @@ pub struct SupportConfig {
     pub penetration_mm: f64,
     pub min_height_mm: f64,
     pub max_height_mm: f64,
+    /// Maximum root zone outside the model's XY bounds and maximum additional
+    /// detour beyond the direct root-to-contact route.
+    #[serde(default = "default_branch_max_distance_mm")]
+    pub branch_max_distance_mm: f64,
+    /// Maximum number of contact arms emitted by one shared tree trunk.
+    #[serde(default = "default_branch_max_children")]
+    pub branch_max_children: u32,
+    /// Diameter cap for the load-dependent shared trunk at the build plate.
+    #[serde(default = "default_branch_max_trunk_diameter_mm")]
+    pub branch_max_trunk_diameter_mm: f64,
     pub radial_segments: u32,
     #[serde(default)]
     pub manual_points: Vec<SupportPoint>,
+}
+
+fn default_support_density_per_cm2() -> f64 {
+    6.25
+}
+
+fn default_branch_max_distance_mm() -> f64 {
+    30.0
+}
+
+fn default_branch_max_children() -> u32 {
+    6
+}
+
+fn default_branch_max_trunk_diameter_mm() -> f64 {
+    3.2
 }
 
 impl SupportConfig {
@@ -147,9 +181,10 @@ impl SupportConfig {
         Self {
             enabled: false,
             auto_generate: true,
-            shape: SupportShape::Tapered,
+            shape: SupportShape::Branch,
             overhang_angle_deg: 45.0,
             spacing_mm: 5.0,
+            density_per_cm2: 4.0,
             tip_diameter_mm: 0.35,
             trunk_diameter_mm: 0.8,
             base_diameter_mm: 3.5,
@@ -158,6 +193,9 @@ impl SupportConfig {
             penetration_mm: 0.15,
             min_height_mm: 2.0,
             max_height_mm: 180.0,
+            branch_max_distance_mm: 30.0,
+            branch_max_children: 6,
+            branch_max_trunk_diameter_mm: 2.5,
             radial_segments: 12,
             manual_points: Vec::new(),
         }
@@ -169,6 +207,8 @@ impl SupportConfig {
             trunk_diameter_mm: 1.2,
             base_diameter_mm: 4.5,
             spacing_mm: 4.0,
+            density_per_cm2: 6.25,
+            branch_max_trunk_diameter_mm: 3.2,
             ..Self::light()
         }
     }
@@ -179,7 +219,9 @@ impl SupportConfig {
             trunk_diameter_mm: 1.8,
             base_diameter_mm: 6.0,
             spacing_mm: 3.0,
+            density_per_cm2: 100.0 / 9.0,
             tip_height_mm: 2.0,
+            branch_max_trunk_diameter_mm: 4.5,
             ..Self::light()
         }
     }
@@ -287,7 +329,6 @@ struct PreparedScene {
     config: SlicerConfig,
     model: Mesh,
     supports: Mesh,
-    combined: Mesh,
     layers: Vec<geometry::LayerSlice>,
     support_count: usize,
     bounds: [f64; 6],
@@ -315,7 +356,7 @@ pub fn slice_file(
         scene.volume_mm3,
     )?;
     Ok(SliceReport {
-        triangle_count: scene.combined.triangles.len(),
+        triangle_count: scene.model.triangles.len() + scene.supports.triangles.len(),
         model_triangle_count: scene.model.triangles.len(),
         support_triangle_count: scene.supports.triangles.len(),
         support_count: scene.support_count,
@@ -360,6 +401,59 @@ pub fn slice_project(project: &SceneProject, output: impl AsRef<Path>) -> Result
         )?;
     }
     slice_report(&scene, output)
+}
+
+/// Slices a project and writes the matching viewer scene from the very same
+/// prepared geometry.  The GUI uses this to avoid loading, tessellating and
+/// slicing a large plate twice.
+pub fn slice_project_with_viewer(
+    project: &SceneProject,
+    output: impl AsRef<Path>,
+    viewer_output: impl AsRef<Path>,
+) -> Result<(SliceReport, ViewerSceneReport)> {
+    let output = output.as_ref();
+    let viewer_output = viewer_output.as_ref();
+    let scene = prepare_project(project)?;
+    let input = &project
+        .objects
+        .iter()
+        .find(|object| object.visible)
+        .ok_or_else(|| Error::InvalidModel("scene project contains no visible objects".into()))?
+        .input;
+    if let Some(previews) = &scene.previews {
+        write_pwsz_with_previews(
+            output,
+            input,
+            &scene.config,
+            &scene.model,
+            &scene.supports,
+            &scene.layers,
+            scene.volume_mm3,
+            previews,
+            scene.pcb_only,
+        )?;
+    } else {
+        write_pwsz(
+            output,
+            input,
+            &scene.config,
+            &scene.model,
+            &scene.supports,
+            &scene.layers,
+            scene.volume_mm3,
+        )?;
+    }
+    write_viewer_scene(
+        viewer_output,
+        &scene.config,
+        &scene.model,
+        &scene.supports,
+        &scene.layers,
+    )?;
+    Ok((
+        slice_report(&scene, output)?,
+        viewer_report(&scene, viewer_output)?,
+    ))
 }
 
 /// Exports transformed triangles, generated supports, and every sliced contour
@@ -448,9 +542,47 @@ pub fn export_project_object_viewer_scene(
     viewer_report(&scene, output)
 }
 
+/// Exports only one transformed mesh for interactive editing.  It deliberately
+/// omits support generation and layer slicing; those expensive operations are
+/// performed once, when the user explicitly presses Slice.
+pub fn export_project_model_viewer_scene(
+    project: &SceneProject,
+    object_index: usize,
+    output: impl AsRef<Path>,
+) -> Result<ViewerSceneReport> {
+    let object = project.objects.get(object_index).ok_or_else(|| {
+        Error::InvalidModel(format!("scene object index {object_index} is out of range"))
+    })?;
+    if !object.visible || object.source_type != SceneObjectType::Model {
+        return Err(Error::InvalidModel(format!(
+            "scene object index {object_index} is not a visible mesh"
+        )));
+    }
+    let mut config = project.config.clone();
+    config.transform = object.transform.clone();
+    config.supports = SupportConfig::default();
+    validate_config(&config)?;
+    let tessellation_error = tessellation_error_mm(&config);
+    let mut mesh = Mesh::load(&object.input, &config.gmsh_path, tessellation_error)?;
+    mesh.apply_transform(&config.transform)?;
+    mesh.repair_for_slicing((tessellation_error * 0.01).max(1.0e-7))?;
+    let output = output.as_ref();
+    let empty = Mesh {
+        triangles: Vec::new(),
+    };
+    write_viewer_scene(output, &config, &mesh, &empty, &[])?;
+    Ok(ViewerSceneReport {
+        model_triangle_count: mesh.triangles.len(),
+        support_triangle_count: 0,
+        support_count: 0,
+        layer_count: 0,
+        output_bytes: std::fs::metadata(output)?.len(),
+    })
+}
+
 fn slice_report(scene: &PreparedScene, output: &Path) -> Result<SliceReport> {
     Ok(SliceReport {
-        triangle_count: scene.combined.triangles.len(),
+        triangle_count: scene.model.triangles.len() + scene.supports.triangles.len(),
         model_triangle_count: scene.model.triangles.len(),
         support_triangle_count: scene.supports.triangles.len(),
         support_count: scene.support_count,
@@ -558,6 +690,7 @@ fn prepare_project_filtered(
     // 2D graph, while 3D welding is only for numerically coincident vertices.
     let weld_tolerance = (tessellation_error * 0.01).max(1.0e-7);
     for instance in visible_models {
+        let mut timings = timing::Timings::new("model");
         let mut instance_config = effective_config.clone();
         instance_config.transform = instance.transform.clone();
         instance_config.supports = instance.supports.clone();
@@ -567,9 +700,18 @@ fn prepare_project_filtered(
             &instance_config.gmsh_path,
             tessellation_error,
         )?;
+        timings.lap("import");
         instance_mesh.apply_transform(&instance_config.transform)?;
+        timings.lap("transform");
         instance_mesh.repair_for_slicing(weld_tolerance)?;
-        let generated = generate_supports(&instance_mesh, &instance_config.supports)?;
+        timings.lap("repair");
+        let generated = generate_supports(
+            &instance_mesh,
+            &instance_config.supports,
+            instance_config.machine.build_volume_mm,
+            instance_config.print.layer_height_mm,
+        )?;
+        timings.lap("generate supports");
         support_count += generated.count;
         model.triangles.extend(instance_mesh.triangles);
         supports.triangles.extend(generated.mesh.triangles);
@@ -589,9 +731,6 @@ fn prepare_project_filtered(
             config: effective_config.clone(),
             model,
             supports,
-            combined: Mesh {
-                triangles: Vec::new(),
-            },
             layers: Vec::new(),
             support_count,
             bounds: [0.0; 6],
@@ -614,12 +753,12 @@ fn prepare_project_filtered(
         for warning in &artwork.warnings {
             eprintln!("PCB warning: {warning}");
         }
-        scene.layers = geometry::merge_layers(
-            &scene.layers,
-            &artwork.layers,
-            effective_config.print.layer_height_mm,
-        );
         let artwork_top = artwork.layers.len() as f64 * effective_config.print.layer_height_mm;
+        scene.layers = geometry::merge_layers(
+            scene.layers,
+            artwork.layers,
+            effective_config.print.layer_height_mm,
+        )?;
         if pcb_only {
             scene.bounds = [
                 artwork.bounds[0],
@@ -670,15 +809,23 @@ fn prepare_loaded_scene(
     tessellation_error: f64,
     topology_verified_cad: bool,
 ) -> Result<PreparedScene> {
-    let mut mesh = model.clone();
-    mesh.triangles.extend_from_slice(&supports.triangles);
-    let (minimum, maximum) = mesh.bounds();
+    let mut timings = timing::Timings::new("scene");
+    let (mut minimum, mut maximum) = model.bounds();
+    if !supports.triangles.is_empty() {
+        let (support_min, support_max) = supports.bounds();
+        minimum = minimum.min(support_min);
+        maximum = maximum.max(support_max);
+    }
     let size = [
         maximum.x - minimum.x,
         maximum.y - minimum.y,
         maximum.z - minimum.z,
     ];
-    let generic_gap = stitch_tolerance * 5.0;
+    // Imported STL files produced by sculpting/export tools commonly contain
+    // tiny T-junction cracks spanning a handful of LCD pixels.  Keep healing
+    // deliberately local: eight pixels closes those export seams while a
+    // genuinely open shell still leaves odd contour nodes and is rejected.
+    let generic_gap = stitch_tolerance * 8.0;
     // On a topologically closed B-Rep, neighbouring faces can sample their
     // common curved edge at different parametric positions. The along-edge
     // separation can approach a whole tessellation chord even though both
@@ -721,6 +868,7 @@ fn prepare_loaded_scene(
             minimum.x, maximum.x, minimum.y, maximum.y, minimum.z, maximum.z
         )));
     }
+    timings.lap("bounds and validation");
     let layers = if supports.triangles.is_empty() {
         slice_mesh(
             &model,
@@ -735,14 +883,17 @@ fn prepare_loaded_scene(
             stitch_tolerance,
             model_gap,
         )?;
-        let support_layers = slice_mesh(
+        timings.lap("model layers");
+        let support_layers = geometry::slice_support_mesh(
             &supports,
             config.print.layer_height_mm,
             stitch_tolerance,
             generic_gap,
         )?;
-        geometry::merge_layers(&model_layers, &support_layers, config.print.layer_height_mm)
+        timings.lap("support layers");
+        geometry::merge_layers(model_layers, support_layers, config.print.layer_height_mm)?
     };
+    timings.lap("layers and merge");
     if let Some(layer) = layers
         .iter()
         .find(|layer| layer.segments.len() > config.machine.max_segments_per_layer)
@@ -762,7 +913,6 @@ fn prepare_loaded_scene(
         config: config.clone(),
         model,
         supports,
-        combined: mesh,
         layers,
         support_count,
         bounds: [
@@ -839,6 +989,7 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
     for (name, value, allow_zero) in [
         ("support overhang angle", supports.overhang_angle_deg, false),
         ("support spacing", supports.spacing_mm, false),
+        ("support density", supports.density_per_cm2, false),
         ("support tip diameter", supports.tip_diameter_mm, false),
         ("support trunk diameter", supports.trunk_diameter_mm, false),
         ("support base diameter", supports.base_diameter_mm, false),
@@ -847,6 +998,16 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
         ("support penetration", supports.penetration_mm, true),
         ("support minimum height", supports.min_height_mm, true),
         ("support maximum height", supports.max_height_mm, false),
+        (
+            "branch maximum distance",
+            supports.branch_max_distance_mm,
+            false,
+        ),
+        (
+            "branch maximum trunk diameter",
+            supports.branch_max_trunk_diameter_mm,
+            false,
+        ),
     ] {
         if !value.is_finite() || value < 0.0 || (!allow_zero && value == 0.0) {
             return Err(Error::InvalidModel(format!("invalid {name}: {value}")));
@@ -867,6 +1028,18 @@ fn validate_config(config: &SlicerConfig) -> Result<()> {
     if supports.min_height_mm > supports.max_height_mm {
         return Err(Error::InvalidModel(
             "support minimum height must not exceed maximum height".into(),
+        ));
+    }
+    if supports.branch_max_children == 0 || supports.branch_max_children > 32 {
+        return Err(Error::InvalidModel(
+            "branch maximum children must be between 1 and 32".into(),
+        ));
+    }
+    if supports.branch_max_trunk_diameter_mm < supports.trunk_diameter_mm
+        || supports.branch_max_trunk_diameter_mm > supports.base_diameter_mm
+    {
+        return Err(Error::InvalidModel(
+            "branch trunk diameters must satisfy trunk <= maximum trunk <= base".into(),
         ));
     }
     let minimum_segments = if supports.shape == SupportShape::Square {
@@ -938,6 +1111,32 @@ mod scene_tests {
         assert!(report.layer_count > 0);
         assert!(report.output_bytes > 0);
         std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn project_slice_and_viewer_share_one_prepared_scene() {
+        let project = SceneProject {
+            config: SlicerConfig::default(),
+            objects: vec![object(fixture("test.stl"), SceneObjectType::Model)],
+        };
+        let id = uuid::Uuid::new_v4().simple();
+        let output = std::env::temp_dir().join(format!("anycubic-shared-scene-{id}.pwsz"));
+        let viewer = std::env::temp_dir().join(format!("anycubic-shared-scene-{id}.acv"));
+        let (slice_report, viewer_report) =
+            slice_project_with_viewer(&project, &output, &viewer).unwrap();
+        assert_eq!(
+            slice_report.model_triangle_count,
+            viewer_report.model_triangle_count
+        );
+        assert_eq!(
+            slice_report.support_triangle_count,
+            viewer_report.support_triangle_count
+        );
+        assert_eq!(slice_report.layer_count, viewer_report.layer_count);
+        assert!(slice_report.output_bytes > 0);
+        assert!(viewer_report.output_bytes > 0);
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(viewer).unwrap();
     }
 
     #[test]

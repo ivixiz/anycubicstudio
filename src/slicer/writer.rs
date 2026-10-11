@@ -1,11 +1,12 @@
 use std::{
     fs::File,
-    io::{Seek, Write},
+    io::{BufWriter, Cursor, Seek, Write},
     path::Path,
 };
 
 use crc32fast::Hasher;
 use flate2::{Compression, write::ZlibEncoder};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
@@ -34,7 +35,9 @@ pub(crate) fn write_pwsz(
     layers: &[LayerSlice],
     volume_mm3: f64,
 ) -> Result<()> {
-    let previews = render_previews(model, supports);
+    let mut timings = super::timing::Timings::new("output");
+    let previews = render_previews(model, supports)?;
+    timings.lap("preview rendering");
     write_pwsz_with_previews(
         output, input, config, model, supports, layers, volume_mm3, &previews, false,
     )
@@ -52,7 +55,8 @@ pub(crate) fn write_pwsz_with_previews(
     previews: &[RenderedImage],
     pcb_mode: bool,
 ) -> Result<()> {
-    let mut archive = ZipWriter::new(File::create(output)?);
+    let mut timings = super::timing::Timings::new("PWSZ");
+    let mut archive = ZipWriter::new(BufWriter::with_capacity(256 * 1024, File::create(output)?));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
     write_json(
         &mut archive,
@@ -100,14 +104,33 @@ pub(crate) fn write_pwsz_with_previews(
         &lcd_function(input, config),
         options,
     )?;
-    for layer in layers {
-        write_member(
-            &mut archive,
-            &format!("layer_images/layer_{}.pwszImg", layer.index),
-            &encode_layer(layer),
-            options,
-        )?;
+    timings.lap("metadata and PNGs");
+    // Compress bounded batches on the shared workers. Merge their already
+    // compressed ZIP entries in layer order, without a second deflate pass.
+    // The layer codec, compression method and level are unchanged.
+    for batch in layers.chunks(128) {
+        let chunks = super::parallel::install(|| {
+            batch
+                .par_chunks(16)
+                .map(|chunk| -> Result<_> {
+                    let mut compressed = ZipWriter::new(Cursor::new(Vec::new()));
+                    for layer in chunk {
+                        write_member(
+                            &mut compressed,
+                            &format!("layer_images/layer_{}.pwszImg", layer.index),
+                            &encode_layer(layer),
+                            options,
+                        )?;
+                    }
+                    Ok(compressed.finish_into_readable()?)
+                })
+                .collect::<Vec<_>>()
+        })?;
+        for compressed in chunks {
+            archive.merge_archive(compressed?)?;
+        }
     }
+    timings.lap("encode and compress layers");
     write_member(
         &mut archive,
         "calc_layer_volumes.data",
@@ -120,7 +143,8 @@ pub(crate) fn write_pwsz_with_previews(
         &encode_scene(model, supports, layers),
         options,
     )?;
-    archive.finish()?;
+    archive.finish()?.flush()?;
+    timings.lap("scene and finish");
     Ok(())
 }
 

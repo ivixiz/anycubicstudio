@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QMatrix4x4>
 #include <QVector>
 #include <QVector2D>
 #include <QVector3D>
@@ -35,9 +36,10 @@ struct ManualSupport {
 struct SupportSettings {
     bool enabled = false;
     bool automatic = true;
-    QString shape = "tapered";
+    QString shape = "branch";
     double angle = 45.0;
     double spacing = 4.0;
+    double density = 6.25;
     double tip = 0.5;
     double trunk = 1.2;
     double base = 4.5;
@@ -46,6 +48,9 @@ struct SupportSettings {
     double penetration = 0.15;
     double minimum_height = 2.0;
     double maximum_height = 180.0;
+    double branch_max_distance = 30.0;
+    int branch_max_children = 6;
+    double branch_max_trunk = 3.2;
     int segments = 12;
     std::vector<ManualSupport> manual;
 };
@@ -75,6 +80,10 @@ struct SceneObject {
     bool mirror_y = false;
     bool mirror_z = false;
     bool editable = true;
+    // Interactive transforms are kept on the GPU, like OrcaSlicer's
+    // GLVolume::world_matrix(). Rust bakes the final transform only for Slice;
+    // ordinary edits never re-import or re-upload the preview mesh.
+    QMatrix4x4 display_transform;
     SupportSettings supports;
     PcbSettings pcb;
     SceneData visual;

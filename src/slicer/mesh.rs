@@ -25,7 +25,7 @@ pub(crate) struct Vec3 {
 }
 
 impl Vec3 {
-    fn min(self, other: Self) -> Self {
+    pub(super) fn min(self, other: Self) -> Self {
         Self {
             x: self.x.min(other.x),
             y: self.y.min(other.y),
@@ -33,7 +33,7 @@ impl Vec3 {
         }
     }
 
-    fn max(self, other: Self) -> Self {
+    pub(super) fn max(self, other: Self) -> Self {
         Self {
             x: self.x.max(other.x),
             y: self.y.max(other.y),
@@ -310,7 +310,7 @@ impl Mesh {
         }
         let original_count = self.triangles.len();
         let inverse = 1.0 / tolerance_mm;
-        let mut unique = HashSet::<[VertexKey; 3]>::new();
+        let mut unique = HashSet::<[VertexKey; 3]>::with_capacity(original_count);
         let minimum_area_vector_squared = tolerance_mm.powi(4) * 1.0e-4;
         self.triangles.retain_mut(|triangle| {
             let mut keys = [VertexKey::default(); 3];

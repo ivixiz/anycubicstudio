@@ -1382,6 +1382,12 @@ impl BitGrid {
         }
     }
 
+    fn and_not_assign(&mut self, other: &Self) {
+        for (target, source) in self.bits.iter_mut().zip(&other.bits) {
+            *target &= !*source;
+        }
+    }
+
     fn pixel_width(&self) -> f64 {
         self.physical_width / f64::from(self.width)
     }
@@ -2252,17 +2258,55 @@ fn prepare_scene_artwork_filtered(
             continue;
         }
         let (artwork, layer_index, _) = transform_artwork(object, source)?;
-        let target = layers
-            .entry(layer_index)
-            .or_insert(LayerRaster::new(&config.machine)?);
+        let bounds = operations_bounds(&artwork.operations)
+            .ok_or_else(|| invalid(format!("{} is empty", object.input.display())))?;
+        let margin = if object.pcb.invert {
+            object.pcb.invert_margin_mm
+        } else {
+            0.0
+        };
+        if bounds[0] - margin < -half_x
+            || bounds[2] + margin > half_x
+            || bounds[1] - margin < -half_y
+            || bounds[3] + margin > half_y
+        {
+            return Err(invalid(format!(
+                "{} lies outside the centered LCD after its scene transform",
+                object.input.display()
+            )));
+        }
+        let mut local = BitGrid::new(&config.machine)?;
+        let mut local_rect = None::<PixelRect>;
         for source in &artwork.operations {
             let operation = Operation {
                 shape: source.shape.clone(),
-                dark: object.pcb.drill_mode == DrillMode::Expose,
+                dark: true,
             };
-            if let Some(rect) = raster_operation(&mut target.grid, &operation) {
-                target.include(rect);
+            if let Some(rect) = raster_operation(&mut local, &operation) {
+                local_rect = Some(local_rect.map_or(rect, |current| current.union(rect)));
             }
+        }
+        if object.pcb.invert {
+            let inverted_bounds = [
+                bounds[0] - margin,
+                bounds[1] - margin,
+                bounds[2] + margin,
+                bounds[3] + margin,
+            ];
+            if let Some(rect) = invert_rect(&mut local, inverted_bounds) {
+                local_rect = Some(local_rect.map_or(rect, |current| current.union(rect)));
+            }
+        }
+        let target = layers
+            .entry(layer_index)
+            .or_insert(LayerRaster::new(&config.machine)?);
+        if object.pcb.drill_mode == DrillMode::Expose {
+            target.grid.or_assign(&local);
+        } else {
+            target.grid.and_not_assign(&local);
+        }
+        if let Some(rect) = local_rect {
+            target.include(rect);
         }
         target.simplify_tolerance_mm = target
             .simplify_tolerance_mm
@@ -2626,6 +2670,36 @@ mod tests {
         assert_eq!(prepared.layers.len(), 1);
         assert_eq!(prepared.layers[0].contours.len(), 2);
         assert!(prepared.layers[0].area() > 58.0 && prepared.layers[0].area() < 60.0);
+    }
+
+    #[test]
+    fn unified_scene_applies_invert_to_a_drill_object() {
+        let drill = fixture(
+            "invert-PTH.drl",
+            "M48\nMETRIC,000.000\nT01C2.000\n%\nT01\nX010000Y005000\nM30\n",
+        );
+        let legacy = small_config();
+        let config = slicer_config(&legacy);
+        let mut normal = SceneObjectConfig {
+            input: drill.clone(),
+            source_type: SceneObjectType::Drill,
+            visible: true,
+            transform: Transform::default(),
+            supports: SupportConfig::default(),
+            pcb: PcbObjectConfig {
+                exposure_s: legacy.exposure_s,
+                auto_mirror_front_layers: false,
+                invert: false,
+                invert_margin_mm: 1.0,
+                drill_mode: DrillMode::Expose,
+                simplify_tolerance_mm: legacy.simplify_tolerance_mm,
+            },
+        };
+        let normal_area = prepare_scene_artwork(&[&normal], &config).unwrap().layers[0].area();
+        normal.pcb.invert = true;
+        let inverted_area = prepare_scene_artwork(&[&normal], &config).unwrap().layers[0].area();
+        std::fs::remove_file(drill).unwrap();
+        assert!(inverted_area > normal_area);
     }
 
     #[test]
