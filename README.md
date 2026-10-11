@@ -1,6 +1,6 @@
 # anycubicstudio
 
-![Main Window](/home/dima/Documents/Code/decompile/anycubicstudio/assets/preview.png)
+![Main Window](./assets/preview.png)
 
 Unofficial async Rust library and diagnostic CLI for interacting with Anycubic resin 3D printers. The protocol was reverse-engineered from Anycubic Photon Workshop 4.1.8 and tested on an Anycubic Photon Mono M7 Pro. 
 
